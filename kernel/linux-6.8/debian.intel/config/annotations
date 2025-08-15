@@ -1,0 +1,65 @@
+# Menu: HEADER
+# FORMAT: 4
+# ARCH: amd64
+# FLAVOUR: amd64-intel
+
+include "../../debian.master/config/annotations"
+
+CONFIG_CAN_F81604                               policy<{'amd64': 'm'}>
+CONFIG_CAN_F81604                               note<'LP#2022887'>
+
+CONFIG_SND_HDA_SCODEC_CS35L41                   policy<{'amd64': '-'}>
+CONFIG_SND_HDA_SCODEC_CS35L41                   note<'LP:#1965496'>
+
+CONFIG_SND_HDA_SCODEC_CS35L41_I2C               policy<{'amd64': 'n'}>
+CONFIG_SND_HDA_SCODEC_CS35L41_I2C               note<'LP:#1965496'>
+
+CONFIG_SND_HDA_SCODEC_CS35L41_SPI               policy<{'amd64': 'n'}>
+CONFIG_SND_HDA_SCODEC_CS35L41_SPI               note<'LP:#1965496'>
+
+CONFIG_SND_SOC_AMD_ACP6x                        policy<{'amd64': 'n'}>
+CONFIG_SND_SOC_AMD_ACP6x                        note<'LP:1949245'>
+
+CONFIG_SND_SOC_AMD_VANGOGH_MACH                 policy<{'amd64': 'n'}>
+CONFIG_SND_SOC_AMD_VANGOGH_MACH                 note<'LP:#1965496'>
+
+CONFIG_SND_SOC_AMD_YC_MACH                      policy<{'amd64': '-'}>
+CONFIG_SND_SOC_AMD_YC_MACH                      note<'LP:1949245'>
+
+CONFIG_SND_SOC_CS35L41                          policy<{'amd64': '-'}>
+CONFIG_SND_SOC_CS35L41                          note<'LP:#1965496'>
+
+CONFIG_SND_SOC_CS35L41_I2C                      policy<{'amd64': 'n'}>
+CONFIG_SND_SOC_CS35L41_I2C                      note<'LP:#1965496'>
+
+CONFIG_SND_SOC_CS35L41_LIB                      policy<{'amd64': '-'}>
+CONFIG_SND_SOC_CS35L41_LIB                      note<'LP:#1965496'>
+
+CONFIG_SND_SOC_CS35L41_SPI                      policy<{'amd64': 'n'}>
+CONFIG_SND_SOC_CS35L41_SPI                      note<'LP:#1965496'>
+
+CONFIG_SND_SOC_INTEL_SOF_CIRRUS_COMMON          policy<{'amd64': '-'}>
+CONFIG_SND_SOC_INTEL_SOF_CIRRUS_COMMON          note<'LP:#1965496'>
+
+CONFIG_SND_SOC_INTEL_SOF_SSP_AMP_MACH           policy<{'amd64': 'n'}>
+CONFIG_SND_SOC_INTEL_SOF_SSP_AMP_MACH           note<'LP:#1965496'>
+
+CONFIG_SPI_INTEL_SPI_PCI                        policy<{'amd64': '-'}>
+CONFIG_SPI_INTEL_SPI_PCI                        note<'LP:#1734147'>
+
+CONFIG_SPI_INTEL_SPI_PLATFORM                   policy<{'amd64': '-'}>
+CONFIG_SPI_INTEL_SPI_PLATFORM                   note<'LP:#1734147'>
+
+
+# ---- Annotations without notes ----
+
+CONFIG_ADXL345                                  policy<{'amd64': 'm'}>
+CONFIG_ADXL345_I2C                              policy<{'amd64': 'm'}>
+CONFIG_ADXL345_SPI                              policy<{'amd64': 'm'}>
+CONFIG_ARCH_KEEP_MEMBLOCK                       policy<{'amd64': 'y'}>
+CONFIG_INPUT_ADXL34X                            policy<{'amd64': 'n'}>
+CONFIG_INPUT_ADXL34X_I2C                        policy<{'amd64': '-'}>
+CONFIG_INPUT_ADXL34X_SPI                        policy<{'amd64': '-'}>
+CONFIG_INTEL_TDX_HOST                           policy<{'amd64': 'y'}>
+CONFIG_X86_AMD_PSTATE                           policy<{'amd64': 'n'}>
+CONFIG_X86_AMD_PSTATE_DEFAULT_MODE              policy<{'amd64': '-'}>

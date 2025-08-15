@@ -1,0 +1,249 @@
+Source: linux-intel
+Section: devel
+Priority: optional
+Maintainer: Ubuntu Kernel Team <kernel-team@lists.ubuntu.com>
+XSC-Ubuntu-Compatible-Signing: ubuntu/4 pro/3
+Rules-Requires-Root: no
+Standards-Version: 3.9.4.0
+Build-Depends:
+ gcc-13, gcc-13-aarch64-linux-gnu [arm64] <cross>, gcc-13-arm-linux-gnueabihf [armhf] <cross>, gcc-13-powerpc64le-linux-gnu [ppc64el] <cross>, gcc-13-riscv64-linux-gnu [riscv64] <cross>, gcc-13-s390x-linux-gnu [s390x] <cross>, gcc-13-x86-64-linux-gnu [amd64] <cross>,
+ debhelper-compat (= 10),
+ cpio,
+ kmod <!stage1>,
+ makedumpfile [amd64] <!stage1>,
+ libcap-dev <!stage1>,
+ libelf-dev <!stage1>,
+ libnewt-dev <!stage1>,
+ libiberty-dev <!stage1>,
+ default-jdk-headless <!stage1>,
+ java-common <!stage1>,
+ rsync [!i386] <!stage1>,
+ libdw-dev <!stage1>,
+ libpci-dev <!stage1>,
+ pkg-config <!stage1>,
+ python3 <!stage1>,
+ python3-dev <!stage1>,
+ flex <!stage1>,
+ bison <!stage1>,
+ libunwind8-dev [amd64] <!stage1>,
+ liblzma-dev <!stage1>,
+ openssl <!stage1>,
+ libssl-dev <!stage1>,
+ libaudit-dev <!stage1>,
+ bc <!stage1>,
+ gawk <!stage1>,
+ libudev-dev <!stage1>,
+ autoconf <!stage1>,
+ automake <!stage1>,
+ libtool <!stage1>,
+ uuid-dev <!stage1>,
+ libnuma-dev [amd64] <!stage1>,
+ dkms <!stage1>,
+ curl <!stage1>,
+ zstd <!stage1>,
+ pahole [amd64] | dwarves (>= 1.21) [amd64 arm64 armhf ppc64el s390x riscv64] <!stage1>,
+ clang-18 [amd64],
+ rustc [amd64],
+ rust-src [amd64],
+ rustfmt [amd64],
+ bindgen-0.65 [amd64],
+ libstdc++-dev,
+Build-Depends-Indep:
+ xmlto <!stage1>,
+ bzip2 <!stage1>,
+ sharutils <!stage1>,
+ asciidoc <!stage1>,
+ python3-docutils <!stage1>,
+Vcs-Git: git://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/noble
+XS-Testsuite: autopkgtest
+#XS-Testsuite-Depends: gcc-4.7 binutils
+
+Package: linux-intel-headers-6.8.0-1005
+Build-Profiles: <!stage1>
+Architecture: all
+Multi-Arch: foreign
+Section: devel
+Priority: optional
+Depends: ${misc:Depends}, coreutils
+Description: Header files related to Linux kernel version 6.8.0
+ This package provides kernel header files for version 6.8.0, for sites
+ that want the latest kernel headers. Please read
+ /usr/share/doc/linux-intel-headers-6.8.0-1005/debian.README.gz for details
+
+Package: linux-intel-tools-6.8.0-1005
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: devel
+Priority: optional
+Depends: ${misc:Depends}, ${shlibs:Depends}, linux-tools-common
+Description: Linux kernel version specific tools for version 6.8.0-1005
+ This package provides the architecture dependant parts for kernel
+ version locked tools (such as perf and x86_energy_perf_policy) for
+ version 6.8.0-1005 on
+ 64 bit x86.
+ You probably want to install linux-tools-6.8.0-1005-<flavour>.
+
+Package: linux-intel-cloud-tools-6.8.0-1005
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: devel
+Priority: optional
+Depends: ${misc:Depends}, ${shlibs:Depends}, linux-cloud-tools-common
+Description: Linux kernel version specific cloud tools for version 6.8.0-1005
+ This package provides the architecture dependant parts for kernel
+ version locked tools for cloud tools for version 6.8.0-1005 on
+ 64 bit x86.
+ You probably want to install linux-cloud-tools-6.8.0-1005-<flavour>.
+
+
+Package: linux-image-unsigned-6.8.0-1005-intel
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: kernel
+Priority: optional
+Provides: linux-image, fuse-module, kvm-api-4, redhat-cluster-modules, ivtv-modules, virtualbox-guest-modules [amd64], ${linux:rprovides}
+Depends: ${misc:Depends}, ${shlibs:Depends}, kmod, linux-base (>= 4.5ubuntu1~16.04.1), linux-modules-6.8.0-1005-intel
+Recommends: grub-pc [amd64] | grub-efi-amd64 [amd64] | grub-efi-ia32 [amd64] | grub [amd64] | lilo [amd64], initramfs-tools | linux-initramfs-tool
+Breaks: flash-kernel (<< 3.90ubuntu2) [arm64 armhf], s390-tools (<< 2.3.0-0ubuntu3) [s390x]
+Conflicts: linux-image-6.8.0-1005-intel
+Suggests: fdutils, linux-doc | linux-intel-source-6.8.0, linux-intel-tools, linux-headers-6.8.0-1005-intel, linux-modules-extra-6.8.0-1005-intel
+Description: Linux kernel image for version 6.8.0 on 64 bit x86 SMP
+ This package contains the unsigned Linux kernel image for version 6.8.0 on
+ 64 bit x86 SMP.
+ .
+ Supports Generic processors.
+ .
+ Geared toward desktop and server systems.
+ .
+ You likely do not want to install this package directly. Instead, install
+ the linux-intel meta-package, which will ensure that upgrades work
+ correctly, and that supporting packages are also installed.
+
+Package: linux-modules-6.8.0-1005-intel
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: kernel
+Priority: optional
+Depends: ${misc:Depends}, ${shlibs:Depends}, linux-image-6.8.0-1005-intel | linux-image-unsigned-6.8.0-1005-intel
+Built-Using: ${linux:BuiltUsing}
+Description: Linux kernel extra modules for version 6.8.0 on 64 bit x86 SMP
+ Contains the corresponding System.map file, the modules built by the
+ packager, and scripts that try to ensure that the system is not left in an
+ unbootable state after an update.
+ .
+ Supports Generic processors.
+ .
+ Geared toward desktop and server systems.
+ .
+ You likely do not want to install this package directly. Instead, install
+ the linux-intel meta-package, which will ensure that upgrades work
+ correctly, and that supporting packages are also installed.
+
+Package: linux-modules-extra-6.8.0-1005-intel
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: kernel
+Priority: optional
+Depends: ${misc:Depends}, ${shlibs:Depends}, linux-image-6.8.0-1005-intel | linux-image-unsigned-6.8.0-1005-intel, wireless-regdb
+Description: Linux kernel extra modules for version 6.8.0 on 64 bit x86 SMP
+ This package contains the Linux kernel extra modules for version 6.8.0 on
+ 64 bit x86 SMP.
+ .
+ Also includes the corresponding System.map file, the modules built by the
+ packager, and scripts that try to ensure that the system is not left in an
+ unbootable state after an update.
+ .
+ Supports Generic processors.
+ .
+ Geared toward desktop and server systems.
+ .
+ You likely do not want to install this package directly. Instead, install
+ the linux-intel meta-package, which will ensure that upgrades work
+ correctly, and that supporting packages are also installed.
+
+Package: linux-headers-6.8.0-1005-intel
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: devel
+Priority: optional
+Depends: ${misc:Depends}, linux-intel-headers-6.8.0-1005, ${shlibs:Depends}
+Provides: linux-headers, linux-headers-3.0
+Description: Linux kernel headers for version 6.8.0 on 64 bit x86 SMP
+ This package provides kernel header files for version 6.8.0 on
+ 64 bit x86 SMP.
+ .
+ This is for sites that want the latest kernel headers.  Please read
+ /usr/share/doc/linux-headers-6.8.0-1005/debian.README.gz for details.
+
+Package: linux-image-unsigned-6.8.0-1005-intel-dbgsym
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: devel
+Priority: optional
+Depends: ${misc:Depends}
+Provides: linux-debug
+Description: Linux kernel debug image for version 6.8.0 on 64 bit x86 SMP
+ This package provides the unsigned kernel debug image for version 6.8.0 on
+ 64 bit x86 SMP.
+ .
+ This is for sites that wish to debug the kernel.
+ .
+ The kernel image contained in this package is NOT meant to boot from. It
+ is uncompressed, and unstripped. This package also includes the
+ unstripped modules.
+
+Package: linux-tools-6.8.0-1005-intel
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: devel
+Priority: optional
+Depends: ${misc:Depends}, linux-intel-tools-6.8.0-1005
+Description: Linux kernel version specific tools for version 6.8.0-1005
+ This package provides the architecture dependant parts for kernel
+ version locked tools (such as perf and x86_energy_perf_policy) for
+ version 6.8.0-1005 on
+ 64 bit x86.
+
+Package: linux-cloud-tools-6.8.0-1005-intel
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: devel
+Priority: optional
+Depends: ${misc:Depends}, linux-intel-cloud-tools-6.8.0-1005
+Description: Linux kernel version specific cloud tools for version 6.8.0-1005
+ This package provides the architecture dependant parts for kernel
+ version locked tools for cloud for version 6.8.0-1005 on
+ 64 bit x86.
+
+Package: linux-buildinfo-6.8.0-1005-intel
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: kernel
+Priority: optional
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Built-Using: ${linux:BuiltUsing}
+Description: Linux kernel buildinfo for version 6.8.0 on 64 bit x86 SMP
+ This package contains the Linux kernel buildinfo for version 6.8.0 on
+ 64 bit x86 SMP.
+ .
+ You likely do not want to install this package.
+
+
+Package: linux-modules-iwlwifi-6.8.0-1005-intel
+Build-Profiles: <!stage1>
+Architecture: amd64
+Section: kernel
+Priority: optional
+Depends:
+ ${misc:Depends},
+ linux-image-6.8.0-1005-intel | linux-image-unsigned-6.8.0-1005-intel,
+Built-Using: ${linux:BuiltUsing}
+Description: Linux kernel iwlwifi modules for version 6.8.0-1005
+ This package provides the Linux kernel iwlwifi modules for version
+ 6.8.0-1005.
+ .
+ You likely do not want to install this package directly. Instead, install the
+ one of the linux-modules-iwlwifi-intel* meta-packages,
+ which will ensure that upgrades work correctly, and that supporting packages are
+ also installed.
+

